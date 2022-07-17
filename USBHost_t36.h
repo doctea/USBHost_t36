@@ -1188,8 +1188,7 @@ public:
 			  | ((data1 & 0x7F) << 16) | ((data2 & 0x7F) << 24));
 		}
 	}
-	void send_now(void) __attribute__((always_inline)) {
-	}
+	void send_now(void); // __attribute__((always_inline)); // {}
 	bool read(uint8_t channel=0);
 	uint8_t getType(void) {
 		return msg_type;
@@ -1329,6 +1328,8 @@ private:
 	uint32_t * const rx_buffer;
 	uint32_t * const tx_buffer1;
 	uint32_t * const tx_buffer2;
+	uint32_t * queued_buffer;
+	uint32_t queued_size;
 	uint16_t rx_size;
 	uint16_t tx_size;
 	//uint32_t rx_queue[RX_QUEUE_SIZE];

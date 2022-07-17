@@ -288,6 +288,13 @@ void MIDIDeviceBase::disconnect()
 	txpipe = NULL;
 }
 
+void MIDIDeviceBase::send_now(void) {
+	// hmmm dont do this else we get a much faster clock than we actually want...?
+	/*if (queued_size>0) {
+		queue_Data_Transfer(txpipe, queued_buffer, queued_size*4, this);
+		queued_size = 0;
+	}*/
+}
 
 void MIDIDeviceBase::write_packed(uint32_t data)
 {
@@ -302,8 +309,10 @@ void MIDIDeviceBase::write_packed(uint32_t data)
 			tx_buffer1[tx1++] = data;
 			tx1_count = tx1;
 			txtimer.stop();
-			if (tx1 >= tx_max) {
-				queue_Data_Transfer(txpipe, tx_buffer1, tx_max*4, this);
+			if (tx1 >= tx_max || data>>8==MidiType::Clock) {	// send if buffer filled or we've just added a clock message
+				queued_buffer = tx_buffer1;
+				queued_size = tx1;
+				queue_Data_Transfer(txpipe, tx_buffer1, tx1/*tx_max*/*4, this);
 			} else {
 				txtimer.start(tx_max >= 128 ? 200 : 1500);
 			}
@@ -315,8 +324,10 @@ void MIDIDeviceBase::write_packed(uint32_t data)
 			tx_buffer2[tx2++] = data;
 			tx2_count = tx2;
 			txtimer.stop();
-			if (tx2 >= tx_max) {
-				queue_Data_Transfer(txpipe, tx_buffer2, tx_max*4, this);
+			if (tx2 >= tx_max || data>>8==MidiType::Clock) {	// send if buffer filled or we've just added a clock message
+				queued_buffer = tx_buffer2;
+				queued_size = tx2;
+				queue_Data_Transfer(txpipe, tx_buffer2, tx2/*tx_max*/*4, this);
 			} else {
 				txtimer.start(tx_max >= 128 ? 200 : 1500);
 			}
