@@ -1188,8 +1188,7 @@ public:
 			  | ((data1 & 0x7F) << 16) | ((data2 & 0x7F) << 24));
 		}
 	}
-	void send_now(void) __attribute__((always_inline)) {
-	}
+	void send_now(void); //__attribute__((always_inline)); //{	}
 	bool read(uint8_t channel=0);
 	uint8_t getType(void) {
 		return msg_type;

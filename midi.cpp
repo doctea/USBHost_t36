@@ -288,21 +288,45 @@ void MIDIDeviceBase::disconnect()
 	txpipe = NULL;
 }
 
+void MIDIDeviceBase::send_now() {
+/*        __disable_irq();
+        
+        if (tx1_count>0) { //} < tx_max && (tx2 == 0 || tx2 >= tx_max))) {
+				txtimer.stop();
+                queue_Data_Transfer(txpipe, tx_buffer1, tx1_count*4, this);
+				txtimer.start(10);
+        } else if (tx2_count>0) {
+				txtimer.stop();
+                queue_Data_Transfer(txpipe, tx_buffer2, tx2_count*4, this);
+				txtimer.start(10);
+		}
+        
+        __enable_irq();*/
+}
+
 
 void MIDIDeviceBase::write_packed(uint32_t data)
 {
 	if (!txpipe) return;
 	uint32_t tx_max = tx_size / 4;
+	uint8_t b0 = (0b00000000000000000000000011111111 & data);
+	uint8_t b1 = (0b00000000000000001111111111111111 & data) >> 8;
+	uint8_t b2 = (0b00000000111111111111111111111111 & data) >> 16;
+	uint8_t b3 = (0b11111111111111111111111111111111 & data) >> 24;
+	bool is_clock = b0==MidiType::Clock || b1==MidiType::Clock || b2==MidiType::Clock || b3==MidiType::Clock;
+
 	while (1) {
 		__disable_irq();
 		uint32_t tx1 = tx1_count;
 		uint32_t tx2 = tx2_count;
-		if (tx1 < tx_max && (tx2 == 0 || tx2 >= tx_max)) {
+		if ((tx1 < tx_max && (tx2 == 0 || tx2 >= tx_max))) {
 			// use tx_buffer1
 			tx_buffer1[tx1++] = data;
 			tx1_count = tx1;
 			txtimer.stop();
-			if (tx1 >= tx_max) {
+			if (is_clock) {
+				queue_Data_Transfer(txpipe, tx_buffer1, tx1_count*4, this);
+			} else if (tx1 >= tx_max) {
 				queue_Data_Transfer(txpipe, tx_buffer1, tx_max*4, this);
 			} else {
 				txtimer.start(tx_max >= 128 ? 200 : 1500);
@@ -315,7 +339,9 @@ void MIDIDeviceBase::write_packed(uint32_t data)
 			tx_buffer2[tx2++] = data;
 			tx2_count = tx2;
 			txtimer.stop();
-			if (tx2 >= tx_max) {
+			if (is_clock) {
+				queue_Data_Transfer(txpipe, tx_buffer2, tx2_count*4, this);
+			} else if (tx2 >= tx_max) {
 				queue_Data_Transfer(txpipe, tx_buffer2, tx_max*4, this);
 			} else {
 				txtimer.start(tx_max >= 128 ? 200 : 1500);
