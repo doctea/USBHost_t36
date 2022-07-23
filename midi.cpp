@@ -314,6 +314,17 @@ void MIDIDeviceBase::write_packed(uint32_t data)
 	uint8_t b2 = (0b00000000111111111111111111111111 & data) >> 16;
 	uint8_t b3 = (0b11111111111111111111111111111111 & data) >> 24;
 	bool is_clock = b0==MidiType::Clock || b1==MidiType::Clock || b2==MidiType::Clock || b3==MidiType::Clock;
+	if (is_clock) println("write_packed got clock");
+	if (b3==MidiType::Clock) println("b3 is clock");
+	if (b2==MidiType::Clock) println("b2 is clock");
+	if (b1==MidiType::Clock) println("b1 is clock");
+	if (b0==MidiType::Clock) println("b0 is clock");
+	if (is_clock) println("----");
+
+	if (is_clock) {
+		//data = 0 | b0; //b1<<24 | b1<<16 | b1<<8 | b0;
+		//return;
+	}
 
 	while (1) {
 		__disable_irq();
@@ -324,10 +335,10 @@ void MIDIDeviceBase::write_packed(uint32_t data)
 			tx_buffer1[tx1++] = data;
 			tx1_count = tx1;
 			txtimer.stop();
-			if (is_clock) {
-				queue_Data_Transfer(txpipe, tx_buffer1, tx1_count*4, this);
-			} else if (tx1 >= tx_max) {
+			if (tx1 >= tx_max) {
 				queue_Data_Transfer(txpipe, tx_buffer1, tx_max*4, this);
+			} else if (is_clock) {
+				queue_Data_Transfer(txpipe, tx_buffer1, tx1_count*4, this);
 			} else {
 				txtimer.start(tx_max >= 128 ? 200 : 1500);
 			}
@@ -339,10 +350,10 @@ void MIDIDeviceBase::write_packed(uint32_t data)
 			tx_buffer2[tx2++] = data;
 			tx2_count = tx2;
 			txtimer.stop();
-			if (is_clock) {
-				queue_Data_Transfer(txpipe, tx_buffer2, tx2_count*4, this);
-			} else if (tx2 >= tx_max) {
+			if (tx2 >= tx_max) {
 				queue_Data_Transfer(txpipe, tx_buffer2, tx_max*4, this);
+			} else if (is_clock) {
+				queue_Data_Transfer(txpipe, tx_buffer2, tx2_count*4, this);
 			} else {
 				txtimer.start(tx_max >= 128 ? 200 : 1500);
 			}
