@@ -796,7 +796,13 @@ bool USBHost::queue_Transfer(Pipe_t *pipe, Transfer_t *transfer)
 {
 	// find halt qTD
 	Transfer_t *halt = (Transfer_t *)(pipe->qh.next);
-	while (!(halt->qtd.token & 0x40)) halt = (Transfer_t *)(halt->qtd.next);
+
+	if (halt==nullptr) return;	// doctea to try and fix crash?
+
+	while (!(halt->qtd.token & 0x40)) {
+		halt = (Transfer_t *)(halt->qtd.next);
+		if ((Transfer_t *)halt->qtd.next==nullptr) break;// doctea to try and fix crash?
+	}
 	// transfer's token
 	uint32_t token = transfer->qtd.token;
 	// transfer becomes new halt qTD

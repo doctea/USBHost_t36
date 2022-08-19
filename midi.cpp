@@ -314,7 +314,7 @@ void MIDIDeviceBase::write_packed(uint32_t data)
 	uint8_t b2 = (0b00000000111111111111111111111111 & data) >> 16;
 	uint8_t b3 = (0b11111111111111111111111111111111 & data) >> 24;
 	bool is_clock = b0==MidiType::Clock || b1==MidiType::Clock || b2==MidiType::Clock || b3==MidiType::Clock;
-	if (is_clock) println("write_packed got clock");
+	/*if (is_clock) println("write_packed got clock");
 	if (b3==MidiType::Clock) println("b3 is clock");
 	if (b2==MidiType::Clock) println("b2 is clock");
 	if (b1==MidiType::Clock) println("b1 is clock");
@@ -324,7 +324,7 @@ void MIDIDeviceBase::write_packed(uint32_t data)
 	if (is_clock) {
 		//data = 0 | b0; //b1<<24 | b1<<16 | b1<<8 | b0;
 		//return;
-	}
+	}*/
 
 	while (1) {
 		__disable_irq();
