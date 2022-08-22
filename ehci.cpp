@@ -503,7 +503,8 @@ void USBDriverTimer::start(uint32_t microseconds)
 			next = list;
 			prev = list->prev;
 			list->prev = this;
-			prev->next = this;
+			if (prev!=nullptr)	// doctea cos crashes?
+				prev->next = this;
 			return;
 		}
 		microseconds -= list->usec;
@@ -797,11 +798,12 @@ bool USBHost::queue_Transfer(Pipe_t *pipe, Transfer_t *transfer)
 	// find halt qTD
 	Transfer_t *halt = (Transfer_t *)(pipe->qh.next);
 
-	if (halt==nullptr) return;	// doctea to try and fix crash?
+	if (halt==nullptr ) return false;	// doctea to try and fix crash?
 
 	while (!(halt->qtd.token & 0x40)) {
+		if ((Transfer_t *)halt->qtd.next==nullptr) 
+			break;// doctea to try and fix crash?
 		halt = (Transfer_t *)(halt->qtd.next);
-		if ((Transfer_t *)halt->qtd.next==nullptr) break;// doctea to try and fix crash?
 	}
 	// transfer's token
 	uint32_t token = transfer->qtd.token;

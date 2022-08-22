@@ -309,10 +309,10 @@ void MIDIDeviceBase::write_packed(uint32_t data)
 {
 	if (!txpipe) return;
 	uint32_t tx_max = tx_size / 4;
-	uint8_t b0 = (0b00000000000000000000000011111111 & data);
+	uint8_t b0 = 0;// (0b00000000000000000000000011111111 & data);
 	uint8_t b1 = (0b00000000000000001111111111111111 & data) >> 8;
-	uint8_t b2 = (0b00000000111111111111111111111111 & data) >> 16;
-	uint8_t b3 = (0b11111111111111111111111111111111 & data) >> 24;
+	uint8_t b2 = 0; //(0b00000000111111111111111111111111 & data) >> 16;
+	uint8_t b3 = 0;//(0b11111111111111111111111111111111 & data) >> 24;
 	bool is_clock = b0==MidiType::Clock || b1==MidiType::Clock || b2==MidiType::Clock || b3==MidiType::Clock;
 	/*if (is_clock) println("write_packed got clock");
 	if (b3==MidiType::Clock) println("b3 is clock");
@@ -325,7 +325,7 @@ void MIDIDeviceBase::write_packed(uint32_t data)
 		//data = 0 | b0; //b1<<24 | b1<<16 | b1<<8 | b0;
 		//return;
 	}*/
-
+	int attempts = 0;	// so that we don't get stuck trying to write -- seems its sometimes possible for device to go away mid-write?
 	while (1) {
 		__disable_irq();
 		uint32_t tx1 = tx1_count;
@@ -362,6 +362,7 @@ void MIDIDeviceBase::write_packed(uint32_t data)
 		}
 		__enable_irq();
 		// TODO: call yield() ??
+		if (attempts++>10000) break;	// give up after an arbitrary number of attempts to write the data (doctea)
 	}
 }
 
