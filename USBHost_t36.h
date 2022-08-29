@@ -1404,6 +1404,20 @@ private:
 };
 
 
+class MIDIDevice_BiggerBuffer : public MIDIDeviceBase {
+public:
+	MIDIDevice_BiggerBuffer(USBHost &host) :
+		MIDIDeviceBase(host, rx, tx1, tx2, MAX_PACKET_SIZE, queue, RX_QUEUE_SIZE) {};
+	// MIDIDevice(USBHost *host) : ....
+private:
+	enum { MAX_PACKET_SIZE = 1024 };
+	enum { RX_QUEUE_SIZE = 800 }; // must be more than MAX_PACKET_SIZE/4
+	uint32_t rx[MAX_PACKET_SIZE/4];
+	uint32_t tx1[MAX_PACKET_SIZE/4];
+	uint32_t tx2[MAX_PACKET_SIZE/4];
+	uint32_t queue[RX_QUEUE_SIZE];
+};
+
 //--------------------------------------------------------------------------
 
 class USBSerialBase: public USBDriver, public Stream {
