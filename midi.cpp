@@ -327,6 +327,7 @@ void MIDIDeviceBase::write_packed(uint32_t data)
 	}*/
 	volatile int attempts = 0;	// so that we don't get stuck trying to write -- seems its sometimes possible for device to go away mid-write?
 	while (1) {
+		bool irqs_enabled = __irq_enabled();
 		__disable_irq();
 		uint32_t tx1 = tx1_count;
 		uint32_t tx2 = tx2_count;
@@ -342,7 +343,7 @@ void MIDIDeviceBase::write_packed(uint32_t data)
 			} else {
 				txtimer.start(tx_max >= 128 ? 200 : 1500);
 			}
-			__enable_irq();
+			if (irqs_enabled) __enable_irq();
 			return;
 		}
 		if (tx2 < tx_max) {
@@ -357,10 +358,10 @@ void MIDIDeviceBase::write_packed(uint32_t data)
 			} else {
 				txtimer.start(tx_max >= 128 ? 200 : 1500);
 			}
-			__enable_irq();
+			if (irqs_enabled) __enable_irq();
 			return;
 		}
-		__enable_irq();
+		if (irqs_enabled) __enable_irq();
 		// TODO: call yield() ??
 		if (attempts++>10000) break;	// give up after an arbitrary number of attempts to write the data (doctea)
 	}
