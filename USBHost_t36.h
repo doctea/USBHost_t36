@@ -1070,6 +1070,18 @@ public:
 			rx_queue(rqueue), max_packet_size(bufsize), rx_queue_size(qsize) {
 				init();
 		}
+	MIDIDeviceBase(USBHost &host, uint16_t bufsize, uint16_t qsize) :
+		MIDIDeviceBase(
+			host, 
+			(uint32_t*)calloc(bufsize/4, sizeof(uint32_t)), 
+			(uint32_t*)calloc(bufsize/4, sizeof(uint32_t)), 
+			(uint32_t*)calloc(bufsize/4, sizeof(uint32_t)), 
+			bufsize, 
+			(uint32_t*)calloc(qsize, sizeof(uint32_t)), 
+			qsize
+		)
+		{}
+		
 	void sendNoteOff(uint8_t note, uint8_t velocity, uint8_t channel, uint8_t cable=0) {
 		send(0x80, note, velocity, channel, cable);
 	}
@@ -1378,29 +1390,31 @@ private:
 class MIDIDevice : public MIDIDeviceBase {
 public:
 	MIDIDevice(USBHost &host) :
-		MIDIDeviceBase(host, rx, tx1, tx2, MAX_PACKET_SIZE, queue, RX_QUEUE_SIZE) {};
+		//MIDIDeviceBase(host, rx, tx1, tx2, MAX_PACKET_SIZE, queue, RX_QUEUE_SIZE) {};
+		MIDIDeviceBase(host, MAX_PACKET_SIZE, RX_QUEUE_SIZE) {}
 	// MIDIDevice(USBHost *host) : ....
 private:
 	enum { MAX_PACKET_SIZE = 64 };
 	enum { RX_QUEUE_SIZE = 80 }; // must be more than MAX_PACKET_SIZE/4
-	uint32_t rx[MAX_PACKET_SIZE/4];
+	/*uint32_t rx[MAX_PACKET_SIZE/4];
 	uint32_t tx1[MAX_PACKET_SIZE/4];
 	uint32_t tx2[MAX_PACKET_SIZE/4];
-	uint32_t queue[RX_QUEUE_SIZE];
+	uint32_t queue[RX_QUEUE_SIZE];*/
 };
 
 class MIDIDevice_BigBuffer : public MIDIDeviceBase {
 public:
 	MIDIDevice_BigBuffer(USBHost &host) :
-		MIDIDeviceBase(host, rx, tx1, tx2, MAX_PACKET_SIZE, queue, RX_QUEUE_SIZE) {};
+		//MIDIDeviceBase(host, rx, tx1, tx2, MAX_PACKET_SIZE, queue, RX_QUEUE_SIZE) {};
+		MIDIDeviceBase(host, MAX_PACKET_SIZE, RX_QUEUE_SIZE) {}
 	// MIDIDevice(USBHost *host) : ....
 private:
 	enum { MAX_PACKET_SIZE = 512 };
 	enum { RX_QUEUE_SIZE = 400 }; // must be more than MAX_PACKET_SIZE/4
-	uint32_t rx[MAX_PACKET_SIZE/4];
+	/*uint32_t rx[MAX_PACKET_SIZE/4];
 	uint32_t tx1[MAX_PACKET_SIZE/4];
 	uint32_t tx2[MAX_PACKET_SIZE/4];
-	uint32_t queue[RX_QUEUE_SIZE];
+	uint32_t queue[RX_QUEUE_SIZE];*/
 };
 
 
