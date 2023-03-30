@@ -72,8 +72,8 @@
 
 // These two defines are timeouts for detecting a connected drive
 // and waiting for it to be operational.
-#define MEDIA_READY_TIMEOUT	1000
-#define MSC_CONNECT_TIMEOUT 4000
+#define MEDIA_READY_TIMEOUT	5000 // 1000
+#define MSC_CONNECT_TIMEOUT	5000 // 4000
 
 // Command Block Wrapper Struct
 typedef struct
@@ -153,11 +153,11 @@ typedef struct
 
 // MSC Drive status/info struct
 typedef struct {
-	bool connected   = false; // Device is connected
-	bool initialized = false; // Device is initialized
-	bool mounted     = false; // Device is mounted
-	const char * drvName = 0;
-	uint32_t bufferSize = 0;
+	bool connected;    // Device is connected
+	bool initialized;  // Device is initialized
+	bool mounted;      // Device is mounted
+	const char * drvName;
+	uint32_t bufferSize;
 	uint8_t hubNumber;
 	uint8_t hubPort;
 	uint8_t deviceAddress;

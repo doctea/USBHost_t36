@@ -26,7 +26,7 @@
 
 #include <Arduino.h>
 #include "USBHost_t36.h"  // Read this header first for key info
-#include "USBFilesystemFormatter.h"
+#include "utility/USBFilesystemFormatter.h"
 #define print   USBHost::print_
 #define println USBHost::println_
 
@@ -41,7 +41,13 @@ void inline DBGFlush() {};
 #endif
 
 
-USBFSBase *USBDrive::available_filesystem_list = nullptr;
+USBFSBase *USBFSBase::s_first_fs = nullptr;
+bool USBFSBase::s_any_fs_changed_state = false;
+
+
+USBDrive *USBDrive::s_first_drive = nullptr;
+bool USBDrive::s_connected_filesystems_changed;
+int USBDrive::s_when_to_update = UPDATE_TASK; // default to Task()
 
 static const uint8_t mbdpGuid[16] PROGMEM = {0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44, 0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7};
 
@@ -57,55 +63,10 @@ void USBDrive::init()
 	contribute_Transfers(mytransfers, sizeof(mytransfers)/sizeof(Transfer_t));
 	contribute_String_Buffers(mystring_bufs, sizeof(mystring_bufs)/sizeof(strbuf_t));
 	driver_ready_for_device(this);
-}
 
-void USBDrive::filesystem_ready_for_drive(USBFSBase *fsbase)
-{
-	fsbase->next = NULL;
-	if (available_filesystem_list == NULL) {
-		available_filesystem_list = fsbase;
-	} else {
-		USBFSBase *last = available_filesystem_list;
-		while (last->next) last = last->next;
-		last->next = fsbase;
-	}	
-}
-
-void USBDrive::filesystem_assign_to_drive(USBFSBase *fsbase, bool assign)
-{
-	USBFSBase *prev = nullptr;
-	if (assign) {
-		// We need to remove rom the free list
-		USBFSBase *fs = available_filesystem_list;
-
-		while (fs && (fs != fsbase)) {
-			prev = fs;
-			fs = fs->next;
-		}
-		if (fs) {
-			// unlink it
-			if (prev) prev->next = fs->next;
-			else available_filesystem_list = fs->next;
-			// add it to the Drives claimed list
-			fs->next = claimed_filesystem_list;
-			claimed_filesystem_list = fs;
-		}
-	} else {
-		// lets do the reverse and try to remove from drive list.
-		USBFSBase *fs = claimed_filesystem_list;
-		while (fs && (fs != fsbase)) {
-			prev = fs;
-			fs = fs->next;
-		}
-		if (fs) {
-			// unlink it
-			if (prev) prev->next = fs->next;
-			else claimed_filesystem_list = fs->next;
-			// add it to the Drives claimed list
-			fs->next = available_filesystem_list;
-			available_filesystem_list = fs;
-		}
-	}
+	// Keep a list of drives. 
+	_next_drive = s_first_drive;
+	s_first_drive = this;
 }
 
 
@@ -161,7 +122,7 @@ bool USBDrive::claim(Device_t *dev, int type, const uint8_t *descriptors, uint32
 
 	println("polling intervalIn = ", intervalIn);
 	println("polling intervalOut = ", intervalOut);
-	datapipeIn = new_Pipe(dev, 2, endpointIn, 1, packetSizeIn, intervalIn);
+	datapipeIn = new_Pipe(dev, 2, endpointIn & 0x0F, 1, packetSizeIn, intervalIn);
 	datapipeOut = new_Pipe(dev, 2, endpointOut, 0, packetSizeOut, intervalOut);
 	datapipeIn->callback_function = callbackIn;
 	datapipeOut->callback_function = callbackOut;
@@ -178,7 +139,9 @@ bool USBDrive::claim(Device_t *dev, int type, const uint8_t *descriptors, uint32
 	deviceAvailable = true;
 	msDriveInfo.initialized = false;
 	msDriveInfo.connected = true;
+	_drive_connect_fs_status = USBDRIVE_CONNECTED;
 	_cGPTParts = 0; // have not cached this yet GPT
+
 #ifdef DBGprint
 	print("   connected = ");
 	println(msDriveInfo.connected);
@@ -191,18 +154,21 @@ bool USBDrive::claim(Device_t *dev, int type, const uint8_t *descriptors, uint32
 void USBDrive::disconnect()
 {
 	// We need to go through and release an patitions we are holding onto.
-	USBFSBase *usbfs = claimed_filesystem_list; 
+	DBGPrintf("USBDrive::disconnect %p %p\n", this, device);
+	USBFSBase *usbfs = USBFSBase::s_first_fs; 
 	while (usbfs) {
-		usbfs->releasePartition(); // lets release the partition.
-		USBFSBase *next = usbfs->next;
-
-		usbfs->mydevice = nullptr;
-		usbfs->next = available_filesystem_list;
-		available_filesystem_list = usbfs;
-		usbfs = next;
+		DBGPrintf("\t %p %p\n", usbfs, usbfs->mydevice);
+		if (usbfs->mydevice == device) {
+			usbfs->releasePartition(); // lets release the partition.
+			usbfs->mydevice = nullptr;
+			s_connected_filesystems_changed = true; // 
+		}
+		usbfs = usbfs->_next;
 	}
-	claimed_filesystem_list = nullptr;
- 	_filesystems_started = false;
+ 	// BUGBUG:: maybe check to see if this information is
+ 	// already covered... 
+ 	_drive_connect_fs_status = USBDRIVE_NOT_CONNECTED;
+
 
 	deviceAvailable = false;
 	println("Device Disconnected...");
@@ -217,6 +183,21 @@ void USBDrive::disconnect()
 	println(msDriveInfo.initialized);
 #endif
 }
+
+void USBDrive::Task()
+{
+	if (s_when_to_update != UPDATE_TASK) return;
+	if (_drive_connect_fs_status == USBDRIVE_CONNECTED) {
+		DBGPrintf("\n === Task() Drive %p connected ===\n", this);
+		startFilesystems();
+		DBGPrintf("\nTry Partition list");
+
+		#ifdef DBGprint
+		printPartionTable(Serial);
+		#endif
+	}
+}
+
 
 void USBDrive::control(const Transfer_t *transfer)
 {
@@ -292,8 +273,11 @@ uint8_t USBDrive::mscInit(void) {
 		}
 		yield();
 	} while(!available());
-  
-	msReset();
+
+// Uncommenting "msReset()" will cause certain USB flash drives to fail to init or read/write.
+// Several SanDisk devices have been proven to fail.
+// Possibly due to clearing default power on settings.
+//	msReset(); 
 	// delay(500); // Not needed any more.
 	maxLUN = msGetMaxLun();
 
@@ -1377,32 +1361,76 @@ bool USBDrive::startFilesystems()
 		if (voltype == INVALID_VOL) break;
 		DBGPrintf("\t>>Partition %d VT:%u T:%U %u %u\n", part, voltype, type, firstSector, numSectors);
 		// Now see if there is any file systems that wish to claim this partition.
-		 USBFSBase *usbfsPrev = nullptr;
-		 USBFSBase *usbfs = available_filesystem_list;
+		USBFSBase *usbfs = USBFSBase::s_first_fs;
 
-		 while (usbfs) {
-		 	if (usbfs->claimPartition(this, part, voltype, type, firstSector, numSectors, guid)) break;
-		 	usbfsPrev = usbfs;
-		 	usbfs = usbfs->next;
-		 }
-		 if (usbfs) {
-		 	// unlink
-		 	if (usbfsPrev) usbfsPrev->next = usbfs->next;
-		 	else available_filesystem_list = usbfs->next;
-
-		 	// link to this drives list of claimed
-		 	usbfs->next = claimed_filesystem_list;
-		 	claimed_filesystem_list = usbfs;
-
-		 	// and put a link to us 
-		 	usbfs->mydevice = device;
-		 	file_system_claimed = true;
-		 }
-
+		while (usbfs) {
+			// If the usbfs is not claimed, try to claim it.
+			if ((usbfs->mydevice == nullptr) 
+				&& usbfs->claimPartition(this, part, voltype, type, firstSector, numSectors, guid)) break;
+			usbfs = usbfs->_next;
 		}
-	_filesystems_started = true;
+		if (usbfs) {
+			// Mark it claimed by stashing back link to us in their mydevice
+			// and put a link to us 
+			usbfs->mydevice = device;
+			file_system_claimed = true;
+		 	s_connected_filesystems_changed = true;
+		}
+	}
+	_drive_connect_fs_status = USBDRIVE_FS_STARTED;
 	return file_system_claimed;
 } 
+
+
+//=============================================================================
+// updateConnectedFilesystems()
+// Will go through all of the USBDrive objects and see if the status has
+// changed since the last call and if so, will call the startFilesystem call
+// that will walk the partitions.  
+//=============================================================================
+bool USBDrive::updateConnectedFilesystems()
+{
+  // lets chec each of the drives.
+  //bool drive_list_changed = false;
+  DBGPrintf("USBDrive::updateConnectedFilesystems called\n");
+  bool file_system_started = false;
+  USBDrive *pdrive = s_first_drive;
+  while (pdrive) {
+  	if (pdrive->_drive_connect_fs_status == USBDRIVE_CONNECTED) {
+		DBGPrintf("\n === Drive %p connected ===\n", pdrive);
+		file_system_started |= pdrive->startFilesystems();
+		DBGPrintf("\nTry Partition list");
+
+		#ifdef DBGprint
+		pdrive->printPartionTable(Serial);
+		#endif
+
+	}
+	pdrive = pdrive->_next_drive;
+  }
+  return file_system_started;
+}
+
+
+//=============================================================================
+// USBFSBase methods
+//=============================================================================
+USBFSBase::USBFSBase() {
+	_next = NULL;
+	if (s_first_fs == NULL) {
+		s_first_fs = this;
+	} else {
+		USBFSBase *last = s_first_fs;
+		while (last->_next) last = last->_next;
+		last->_next = this;
+	}		
+}
+
+USBFSBase *USBFSBase::nextFS(USBFSBase *pfs) {
+	if (pfs == nullptr) return s_first_fs;
+	return pfs->_next;
+}
+
 
 //=============================================================================
 // USBFileSystem methods
@@ -1410,7 +1438,6 @@ bool USBDrive::startFilesystems()
 
 void USBFilesystem::init()
 {
-	USBDrive::filesystem_ready_for_drive(this);
 }
 
 FLASHMEM
@@ -1447,45 +1474,10 @@ bool USBFilesystem::check_voltype_guid(int voltype, uint8_t *guid) {
 	return true;
 }
 
-//=============================================================================
-// USBFilesystem::begin - Manual way to startup a filesystem object
-//=============================================================================
-
-bool USBFilesystem::begin(USBDrive *pDrive, bool setCwv, uint8_t part) {
-	DBGPrintf(">>USBFilesystem::begin(%p, %u, %u)\n", pDrive, setCwv, part); DBGFlush();
-	if (device) return false;  // object is already in use. 
-	uint8_t guid[16];
-	device = pDrive;
-	device->begin();
-	if (device->errorCode() != 0) return false;
-	//device->printPartionTable(Serial);
-	int type;
-	uint32_t firstSector, numSectors;
-	uint32_t mbrLBA;
-	uint8_t mbrPart;
-
-
-	int voltype = device->findPartition(part, type, firstSector, numSectors, mbrLBA, mbrPart, guid);
-	if (!voltype) {
-		device = nullptr;
-		return false;  // not a valid volume...
-	}
-
-	// if this is a GPT setup, then make sure the guid is one we want.
-	if (!check_voltype_guid(voltype, guid)) {
-		device = nullptr;
-		return false;
-	}
-
-	if (mscfs.begin(pDrive, setCwv, firstSector, numSectors)) {
-		device->filesystem_assign_to_drive(this, true);
-	}
-	return true;
-}
-
-void USBFilesystem::end(bool update_list) {
+void USBFilesystem::end() {
 	mscfs.end();
-	if (update_list) device->filesystem_assign_to_drive(this, false);
+	_state_changed = USBFS_STATE_CHANGE_CONNECTION;
+	s_any_fs_changed_state = true;
 	device = nullptr;
 }
 
@@ -1501,6 +1493,8 @@ bool USBFilesystem::claimPartition(USBDrive *pdevice, int part,int voltype, int 
 		device = pdevice;
 		partition = part;
 		partitionType = type;
+		_state_changed = USBFS_STATE_CHANGE_CONNECTION;
+		s_any_fs_changed_state = true;
 		DBGPrintf("+ Claimed\n");
 		return true;		
 	}
@@ -1510,7 +1504,7 @@ bool USBFilesystem::claimPartition(USBDrive *pdevice, int part,int voltype, int 
 
 void USBFilesystem::releasePartition() {
 	DBGPrintf("\t USBFilesystem::releasePartition %p called\n");
-	end(false);
+	end();
 }
 
 bool USBFilesystem::format(int type, char progressChar, Print& pr) {
@@ -1520,7 +1514,7 @@ bool USBFilesystem::format(int type, char progressChar, Print& pr) {
 	// lets align the buffer
     uint8_t *aligned_buf = (uint8_t *)(((uintptr_t)buf + 31) & ~((uintptr_t)(31)));
 	USBFilesystemFormatter formatter; 
-	Serial.printf("$$call formatter.format(%p, 0, %p %p...)\n", this, buf, aligned_buf);
+	//Serial.printf("$$call formatter.format(%p, 0, %p %p...)\n", this, buf, aligned_buf);
 	bool ret = formatter.format(*this, 0, aligned_buf, &pr);
 
 	free(buf);
@@ -1547,7 +1541,8 @@ bool USBFilesystem::format(int type, char progressChar, Print& pr) {
 		partitionType = type;
 		ret = mscfs.begin(device, true, firstSector, numSectors);
 		pr.printf("\tbegin return: %u\n", ret);
-		changed(true);  // mark it as changed.
+		_state_changed = USBFS_STATE_CHANGE_FORMAT;
+		s_any_fs_changed_state = true;
 	}
 	return ret;
 }
