@@ -494,7 +494,7 @@ void USBDriverTimer::start(uint32_t microseconds)
 	// add this timer to the schedule, somewhere after the first timer
 	microseconds -= remain;
 	USBDriverTimer *list = active_timers;
-	while (list->next) {
+	while (list!=nullptr && list->next) {
 		list = list->next;
 		if (microseconds < list->usec) {
 			// add timer into middle of list
@@ -807,9 +807,15 @@ bool USBHost::queue_Data_Transfer(Pipe_t *pipe, void *buffer, uint32_t len, USBD
 bool USBHost::queue_Transfer(Pipe_t *pipe, Transfer_t *transfer)
 {
 	// find halt qTD
+	if (pipe==nullptr) return false;
 	Transfer_t *halt = (Transfer_t *)(pipe->qh.next);
 
 	if (halt==nullptr ) return false;	// doctea to try and fix crash?
+
+	// We always want to do this while the interrupt is disabled. 
+	// But only re-enable if it was enabled coming in. 
+	bool irq_was_enabled = NVIC_IS_ENABLED(IRQ_USBHS);
+	NVIC_DISABLE_IRQ(IRQ_USBHS);
 
 	while (!(halt->qtd.token & 0x40)) {
 		if ((Transfer_t *)halt->qtd.next==nullptr) 
@@ -862,6 +868,8 @@ bool USBHost::queue_Transfer(Pipe_t *pipe, Transfer_t *transfer)
 	}
 	// old halt becomes new transfer, this commits all new qTDs to QH
 	halt->qtd.token = token;
+	if (irq_was_enabled) NVIC_ENABLE_IRQ(IRQ_USBHS);
+
 	return true;
 }
 
