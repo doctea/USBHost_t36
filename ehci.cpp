@@ -808,14 +808,19 @@ bool USBHost::queue_Transfer(Pipe_t *pipe, Transfer_t *transfer)
 {
 	// find halt qTD
 	if (pipe==nullptr) return false;
-	Transfer_t *halt = (Transfer_t *)(pipe->qh.next);
-
-	if (halt==nullptr ) return false;	// doctea to try and fix crash?
 
 	// We always want to do this while the interrupt is disabled. 
 	// But only re-enable if it was enabled coming in. 
 	bool irq_was_enabled = NVIC_IS_ENABLED(IRQ_USBHS);
 	NVIC_DISABLE_IRQ(IRQ_USBHS);
+
+	Transfer_t *halt = (Transfer_t *)(pipe->qh.next);
+
+	if (halt==nullptr) {
+		if (irq_was_enabled) NVIC_ENABLE_IRQ(IRQ_USBHS);
+
+		return false;	// doctea to try and fix crash?
+	}
 
 	while (!(halt->qtd.token & 0x40)) {
 		if ((Transfer_t *)halt->qtd.next==nullptr) 

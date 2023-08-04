@@ -307,7 +307,7 @@ void MIDIDeviceBase::send_now() {
 
 void MIDIDeviceBase::write_packed(uint32_t data)
 {
-	if (!txpipe) return;
+	if (txpipe==nullptr || !txpipe) return;
 	volatile const uint32_t tx_max = tx_size / 4;
 	volatile const uint8_t b0 = 0;// (0b00000000000000000000000011111111 & data);
 	volatile const uint8_t b1 = (0b00000000000000001111111111111111 & data) >> 8;
