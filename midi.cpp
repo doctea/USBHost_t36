@@ -327,8 +327,8 @@ void MIDIDeviceBase::write_packed(uint32_t data)
 	}*/
 	volatile int attempts = 0;	// so that we don't get stuck trying to write -- seems its sometimes possible for device to go away mid-write?
 	while (1) {
-		bool irqs_enabled = __irq_enabled();
-		__disable_irq();
+		//bool irqs_enabled = __irq_enabled();
+		//__disable_irq();
 		uint32_t tx1 = tx1_count;
 		uint32_t tx2 = tx2_count;
 		if ((tx1 < tx_max && (tx2 == 0 || tx2 >= tx_max))) {
@@ -343,7 +343,7 @@ void MIDIDeviceBase::write_packed(uint32_t data)
 			} else {
 				txtimer.start(tx_max >= 128 ? 200 : 1500);
 			}
-			if (irqs_enabled) __enable_irq();
+			//if (irqs_enabled) __enable_irq();
 			return;
 		}
 		if (tx2 < tx_max) {
@@ -358,10 +358,10 @@ void MIDIDeviceBase::write_packed(uint32_t data)
 			} else {
 				txtimer.start(tx_max >= 128 ? 200 : 1500);
 			}
-			if (irqs_enabled) __enable_irq();
+			//if (irqs_enabled) __enable_irq();
 			return;
 		}
-		if (irqs_enabled) __enable_irq();
+		//if (irqs_enabled) __enable_irq();
 		// TODO: call yield() ??
 		if (attempts++>10000) break;	// give up after an arbitrary number of attempts to write the data (doctea)
 	}
@@ -435,18 +435,20 @@ bool MIDIDeviceBase::read(uint8_t channel)
 {
 	uint32_t n, head, tail, avail, ch, type1, type2, b1;
 
+	__disable_irq();
+	bool packet_queued = rx_packet_queued;
 	head = rx_head;
 	tail = rx_tail;
+	__enable_irq();
 	if (head == tail) return false;
 	if (++tail >= rx_queue_size) tail = 0;
 	n = rx_queue[tail];
 	rx_tail = tail;
-	if (!rx_packet_queued && rxpipe) {
+	if (!packet_queued && rxpipe) {
 	        avail = (head < tail) ? tail - head - 1 : rx_queue_size - 1 - head + tail;
 		if (avail >= (uint32_t)(rx_size>>2)) {
-			__disable_irq();
+			rx_packed_queued = true;
 			queue_Data_Transfer(rxpipe, rx_buffer, rx_size, this);
-			__enable_irq();
 		}
 	}
 	println("read: ", n, HEX);
