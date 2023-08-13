@@ -807,6 +807,7 @@ bool USBHost::queue_Data_Transfer(Pipe_t *pipe, void *buffer, uint32_t len, USBD
 bool USBHost::queue_Transfer(Pipe_t *pipe, Transfer_t *transfer)
 {
 	// find halt qTD
+	if (pipe==nullptr) return false;
 	Transfer_t *halt = (Transfer_t *)(pipe->qh.next);
 
 	if (halt==nullptr ) return false;	// doctea to try and fix crash?
