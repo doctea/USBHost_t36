@@ -447,7 +447,7 @@ bool MIDIDeviceBase::read(uint8_t channel)
 	if (!packet_queued && rxpipe) {
 	        avail = (head < tail) ? tail - head - 1 : rx_queue_size - 1 - head + tail;
 		if (avail >= (uint32_t)(rx_size>>2)) {
-			rx_packed_queued = true;
+			rx_packet_queued = true;
 			queue_Data_Transfer(rxpipe, rx_buffer, rx_size, this);
 		}
 	}
