@@ -24,6 +24,15 @@
 #ifndef USB_HOST_TEENSY36_
 #define USB_HOST_TEENSY36_
 
+// https://github.com/PaulStoffregen/cores/issues/633
+static inline int __irq_enabled() __attribute__((always_inline, unused));
+static inline int __irq_enabled()
+{
+    uint32_t pm;
+    __asm__ volatile("MRS %0,PRIMASK" : "=r"(pm)::);
+    return (pm & 1) == 0;
+};
+
 #include <stdint.h>
 #include <FS.h>
 
@@ -1318,6 +1327,11 @@ public:
         }
     }
     void send_now(void) __attribute__((always_inline)) {
+        /*NVIC_DISABLE_IRQ(IRQ_USBHS);
+        txtimer.stop();  		// Stop longer timer.
+        txtimer.start(100);		// Start a mimimal timeout
+    //	timer_event(nullptr);   // Try calling direct - fails to work 
+        NVIC_ENABLE_IRQ(IRQ_USBHS);*/
     }
     bool read(uint8_t channel = 0);
     uint8_t getType(void) {

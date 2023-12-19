@@ -293,7 +293,9 @@ void MIDIDeviceBase::write_packed(uint32_t data)
 {
 	if (!txpipe) return;
 	uint32_t tx_max = tx_size / 4;
-	while (1) {
+	uint32_t attempts = 0;
+	while (1 && attempts < 1000) {
+		bool irqs_enabled = __irq_enabled();
 		__disable_irq();
 		uint32_t tx1 = tx1_count;
 		uint32_t tx2 = tx2_count;
@@ -307,7 +309,7 @@ void MIDIDeviceBase::write_packed(uint32_t data)
 			} else {
 				txtimer.start(tx_max >= 128 ? 200 : 1500);
 			}
-			__enable_irq();
+			if (irqs_enabled) __enable_irq();
 			return;
 		}
 		if (tx2 < tx_max) {
@@ -320,11 +322,14 @@ void MIDIDeviceBase::write_packed(uint32_t data)
 			} else {
 				txtimer.start(tx_max >= 128 ? 200 : 1500);
 			}
-			__enable_irq();
+			if (irqs_enabled) __enable_irq();
 			return;
 		}
-		__enable_irq();
+		if (irqs_enabled) __enable_irq();
 		// TODO: call yield() ??
+		yield();
+
+		attempts++;
 	}
 }
 
@@ -395,11 +400,12 @@ void MIDIDeviceBase::send_sysex_add_term_bytes(const uint8_t *data, uint32_t len
 bool MIDIDeviceBase::read(uint8_t channel)
 {
 	uint32_t n, head, tail, avail, ch, type1, type2, b1;
+	bool irqs_enabled = __irq_enabled();
 	__disable_irq();
 	bool packet_queued = rx_packet_queued;
 	head = rx_head;
 	tail = rx_tail;
-	__enable_irq();
+	if (irqs_enabled) __enable_irq();
 	if (head == tail) return false;
 	if (++tail >= rx_queue_size) tail = 0;
 	n = rx_queue[tail];

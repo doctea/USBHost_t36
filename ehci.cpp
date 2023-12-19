@@ -504,6 +504,7 @@ void USBDriverTimer::start(uint32_t microseconds)
 	//USBHDBGSerial.println(remain);
 	if (microseconds < remain) {
 		// this timer event is before any on the schedule
+		bool irqs_enabled = __irq_enabled();
 		__disable_irq();
 		USBHS_GPTIMER1CTL = 0;
 		USBHS_USBSTS = USBHS_USBSTS_TI1; // TODO: UPI & UAI safety?!
@@ -515,7 +516,7 @@ void USBDriverTimer::start(uint32_t microseconds)
 		active_timers = this;
 		USBHS_GPTIMER1LD = microseconds - 1;
 		USBHS_GPTIMER1CTL = USBHS_GPTIMERCTL_RST | USBHS_GPTIMERCTL_RUN;
-		__enable_irq();
+		if (irqs_enabled) __enable_irq();
 		return;
 	}
 	// add this timer to the schedule, somewhere after the first timer
@@ -544,6 +545,7 @@ void USBDriverTimer::start(uint32_t microseconds)
 
 void USBDriverTimer::stop()
 {
+	bool irqs_enabled = __irq_enabled();
 	__disable_irq();
 	if (active_timers) {
 		if (active_timers == this) {
@@ -572,7 +574,7 @@ void USBDriverTimer::stop()
 			}
 		}
 	}
-	__enable_irq();
+	if (irqs_enabled) __enable_irq();
 }
 
 
@@ -832,6 +834,9 @@ bool USBHost::queue_Data_Transfer(Pipe_t *pipe, void *buffer, uint32_t len, USBD
 
 bool USBHost::queue_Transfer(Pipe_t *pipe, Transfer_t *transfer)
 {
+	if (pipe==nullptr) 	// doctea, to attempt to fix crash when a pipe isnt available
+		return false;
+
 	// find halt qTD
 	Transfer_t *halt = (Transfer_t *)(pipe->qh.next);
 	while (!(halt->qtd.token & 0x40)) halt = (Transfer_t *)(halt->qtd.next);
