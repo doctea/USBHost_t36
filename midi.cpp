@@ -293,7 +293,8 @@ void MIDIDeviceBase::write_packed(uint32_t data)
 {
 	if (!txpipe) return;
 	uint32_t tx_max = tx_size / 4;
-	while (1) {
+	uint32_t attempts = 0;
+	while (1 && attempts < 1000) {
 		bool irq_was_enabled = __irq_enabled();
 		__disable_irq();
 		uint32_t tx1 = tx1_count;
@@ -326,6 +327,9 @@ void MIDIDeviceBase::write_packed(uint32_t data)
 		}
 		if (irq_was_enabled) __enable_irq();
 		// TODO: call yield() ??
+		yield();
+
+		attempts++;
 	}
 }
 
