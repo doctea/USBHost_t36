@@ -33,6 +33,15 @@
 #include "utility/imxrt_usbhs.h"
 #include "utility/msc.h"
 
+// https://github.com/PaulStoffregen/cores/issues/633
+static inline int __irq_enabled() __attribute__((always_inline, unused));
+static inline int __irq_enabled()
+{
+    uint32_t pm;
+    __asm__ volatile("MRS %0,PRIMASK" : "=r"(pm)::);
+    return (pm & 1) == 0;
+};
+
 // Dear inquisitive reader, USB is a complex protocol defined with
 // very specific terminology.  To have any chance of understand this
 // source code, you absolutely must have solid knowledge of specific
