@@ -834,9 +834,22 @@ bool USBHost::queue_Data_Transfer(Pipe_t *pipe, void *buffer, uint32_t len, USBD
 
 bool USBHost::queue_Transfer(Pipe_t *pipe, Transfer_t *transfer)
 {
+	bool irq_was_enabled = __irq_enabled();
+	__disable_irq();
+
+	if (pipe==nullptr) {
+		if (irq_was_enabled) __enable_irq();
+		return false;
+	}
 	// find halt qTD
 	Transfer_t *halt = (Transfer_t *)(pipe->qh.next);
-	while (!(halt->qtd.token & 0x40)) halt = (Transfer_t *)(halt->qtd.next);
+	while (!(halt->qtd.token & 0x40)) {
+		halt = (Transfer_t *)(halt->qtd.next);
+		if (halt==nullptr) {
+			if (irq_was_enabled) __enable_irq();
+			return false;
+		}
+	}
 	// transfer's token
 	uint32_t token = transfer->qtd.token;
 	// transfer becomes new halt qTD
@@ -883,6 +896,7 @@ bool USBHost::queue_Transfer(Pipe_t *pipe, Transfer_t *transfer)
 	}
 	// old halt becomes new transfer, this commits all new qTDs to QH
 	halt->qtd.token = token;
+	if (irq_was_enabled) __enable_irq();
 	return true;
 }
 
