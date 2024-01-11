@@ -843,6 +843,10 @@ bool USBHost::queue_Transfer(Pipe_t *pipe, Transfer_t *transfer)
 	}
 	// find halt qTD
 	Transfer_t *halt = (Transfer_t *)(pipe->qh.next);
+	if (halt==nullptr) {
+		if (irq_was_enabled) __enable_irq();
+		return false;
+	}
 	while (!(halt->qtd.token & 0x40)) {
 		halt = (Transfer_t *)(halt->qtd.next);
 		if (halt==nullptr) {
