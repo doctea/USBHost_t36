@@ -159,6 +159,19 @@ void USBHost::enumeration(const Transfer_t *transfer)
 	//print_hexbytes(transfer->buffer, transfer->length);
 	//print(transfer);
 	dev = transfer->pipe->device;
+	if (!dev) return;
+
+	if ((transfer->qtd.token & 0x40) && dev->enum_state < 15) {
+		println("enumeration error, token=", transfer->qtd.token, HEX);
+		if (dev->enum_state >= 4 && dev->enum_state <= 10) {
+			// string descriptors are optional, devices may STALL them
+			dev->enum_state = 11;
+		} else {
+			dev->enum_state = 15;
+			USBHost::enumeration_busy = false;
+			return;
+		}
+	}
 
 	while (1) {
 		// Within this large switch/case, "break" means we've done
@@ -264,6 +277,8 @@ void USBHost::enumeration(const Transfer_t *transfer)
 				enumlen = sizeof(enumbuf);
 				// TODO: how to handle device with too much config data
 			}
+			// a short read then leaves zeros, which claim_drivers treats as the end
+			memset(enumbuf, 0, enumlen);
 			mk_setup(enumsetup, 0x80, 6, 0x0200, 0, enumlen); // 6=GET_DESCRIPTOR
 			queue_Control_Transfer(dev, &enumsetup, enumbuf, NULL);
 			dev->enum_state = 13;
@@ -328,6 +343,8 @@ void USBHost::claim_drivers(Device_t *dev)
 {
 	USBDriver *driver, *prev=NULL;
 
+	if (enumlen < 9) return;
+
 	// first check if any driver wishes to claim the entire device
 	for (driver=available_drivers; driver != NULL; driver = driver->next) {
 		if (driver->device != NULL) continue;
@@ -349,6 +366,7 @@ void USBHost::claim_drivers(Device_t *dev)
 	const uint8_t *end = enumbuf + enumlen;
 	while (p < end) {
 		uint8_t desclen = *p;
+		if (desclen < 2 || p + desclen > end) break;
 		uint8_t desctype = *(p+1);
 		print("Descriptor ");
 		print(desctype);
@@ -430,6 +448,9 @@ void USBHost::disconnect_Device(Device_t *dev)
 {
 	if (!dev) return;
 	println("disconnect_Device:");
+
+	// unplugged mid-enumeration, release the lock so other devices can enumerate
+	if (dev->enum_state < 15) USBHost::enumeration_busy = false;
 
 	// Disconnect all drivers using this device.  If this device is
 	// a hub, the hub driver is responsible for recursively calling

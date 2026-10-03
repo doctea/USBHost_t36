@@ -285,6 +285,8 @@ public:
     static void begin();
     static void Task();
     static void countFree(uint32_t &devices, uint32_t &pipes, uint32_t &trans, uint32_t &strs);
+    // true once the EHCI has reported a host system error (controller halts)
+    static bool hadSystemError() { return system_error; }
 protected:
     static Pipe_t * new_Pipe(Device_t *dev, uint32_t type, uint32_t endpoint,
                              uint32_t direction, uint32_t maxlen, uint32_t interval = 0);
@@ -323,6 +325,8 @@ private:
     static void add_qh_to_periodic_schedule(Pipe_t *pipe);
     static bool followup_Transfer(Transfer_t *transfer);
     static void followup_Error(void);
+    static void followup_Error_list(bool periodic);
+    static volatile bool system_error;
 public: // Maybe others may want/need to contribute memory example HID devices may want to add transfers.
 #ifdef USBHOST_PRINT_DEBUG
     static void print_(const Transfer_t *transfer);

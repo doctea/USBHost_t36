@@ -37,6 +37,7 @@
 
 #define USBHS_USBSTS_AAI	USB_USBSTS_AAI
 #define USBHS_USBSTS_AS		USB_USBSTS_AS
+#define USBHS_USBSTS_PS		USB_USBSTS_PS
 // UAI & UPI bits are undocumented in IMXRT, K66 pg 1602, RT1050 pg 2374
 #define USBHS_USBSTS_UAI	((uint32_t)(1<<18))
 #define USBHS_USBSTS_UPI	((uint32_t)(1<<19))

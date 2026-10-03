@@ -256,8 +256,7 @@ void MIDIDeviceBase::rx_data(const Transfer_t *transfer)
 	if (avail >= (uint32_t)(rx_size>>2)) {
 		// enough space to accept another full packet
 		println("queue another receive packet");
-		queue_Data_Transfer(rxpipe, rx_buffer, rx_size, this);
-		rx_packet_queued = true;
+		rx_packet_queued = queue_Data_Transfer(rxpipe, rx_buffer, rx_size, this);
 	} else {
 		// queue can't accept another packet's data, so leave
 		// the data waiting on the device until we can accept it
@@ -284,8 +283,12 @@ void MIDIDeviceBase::disconnect()
 	// should rx_queue be cleared?
 	// as-is, the user can still read MIDI messages
 	// which arrived before the device disconnected.
+	txtimer.stop();
 	rxpipe = NULL;
 	txpipe = NULL;
+	tx1_count = 0;
+	tx2_count = 0;
+	rx_packet_queued = false;
 }
 
 
@@ -297,6 +300,10 @@ void MIDIDeviceBase::write_packed(uint32_t data)
 	while (1 && attempts < 100000) {
 		bool irq_was_enabled = __irq_enabled();
 		__disable_irq();
+		if (!txpipe) {
+			if (irq_was_enabled) __enable_irq();
+			return;
+		}
 		uint32_t tx1 = tx1_count;
 		uint32_t tx2 = tx2_count;
 		if (tx1 < tx_max && (tx2 == 0 || tx2 >= tx_max)) {
@@ -305,7 +312,7 @@ void MIDIDeviceBase::write_packed(uint32_t data)
 			tx1_count = tx1;
 			txtimer.stop();
 			if (tx1 >= tx_max) {
-				queue_Data_Transfer(txpipe, tx_buffer1, tx_max*4, this);
+				if (!queue_Data_Transfer(txpipe, tx_buffer1, tx_max*4, this)) tx1_count = 0;
 			} else {
 				txtimer.start(tx_max >= 128 ? 200 : 1500);
 			}
@@ -318,7 +325,7 @@ void MIDIDeviceBase::write_packed(uint32_t data)
 			tx2_count = tx2;
 			txtimer.stop();
 			if (tx2 >= tx_max) {
-				queue_Data_Transfer(txpipe, tx_buffer2, tx_max*4, this);
+				if (!queue_Data_Transfer(txpipe, tx_buffer2, tx_max*4, this)) tx2_count = 0;
 			} else {
 				txtimer.start(tx_max >= 128 ? 200 : 1500);
 			}
@@ -335,16 +342,17 @@ void MIDIDeviceBase::write_packed(uint32_t data)
 
 void MIDIDeviceBase::timer_event(USBDriverTimer *timer)
 {
+	if (!txpipe) return;
 	const uint32_t tx_max = tx_size / 4;
 	uint32_t tx1 = tx1_count;
-	if (tx1 > 0) {
+	if (tx1 > 0 && tx1 < tx_max) {
 		tx1_count = tx_max;
-		queue_Data_Transfer(txpipe, tx_buffer1, tx1*4, this);
+		if (!queue_Data_Transfer(txpipe, tx_buffer1, tx1*4, this)) tx1_count = 0;
 	}
 	uint32_t tx2 = tx2_count;
-	if (tx2 > 0) {
+	if (tx2 > 0 && tx2 < tx_max) {
 		tx2_count = tx_max;
-		queue_Data_Transfer(txpipe, tx_buffer2, tx2*4, this);
+		if (!queue_Data_Transfer(txpipe, tx_buffer2, tx2*4, this)) tx2_count = 0;
 	}
 }
 
@@ -413,8 +421,7 @@ bool MIDIDeviceBase::read(uint8_t channel)
 	if (!packet_queued && rxpipe) {
 	        avail = (head < tail) ? tail - head - 1 : rx_queue_size - 1 - head + tail;
 		if (avail >= (uint32_t)(rx_size>>2)) {
-			rx_packet_queued = true;
-			queue_Data_Transfer(rxpipe, rx_buffer, rx_size, this);
+			rx_packet_queued = queue_Data_Transfer(rxpipe, rx_buffer, rx_size, this);
 		}
 	}
 	println("read: ", n, HEX);

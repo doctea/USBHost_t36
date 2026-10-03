@@ -104,8 +104,53 @@ static void remove_from_periodic_followup_list(Transfer_t *transfer);
 #define print   USBHost::print_
 #define println USBHost::println_
 
+volatile bool USBHost::system_error = false;
+
+// Busy-waits use the cycle counter: micros() stops advancing while SysTick is blocked (eg in the USB ISR).
+static inline uint32_t us_to_cycles(uint32_t us)
+{
+#if defined(__IMXRT1052__) || defined(__IMXRT1062__)
+	return us * (F_CPU_ACTUAL / 1000000);
+#else
+	return us * (F_CPU / 1000000);
+#endif
+}
+
+// Returns false on timeout or if the controller has halted.
+static bool wait_usbsts(uint32_t mask, uint32_t want, uint32_t timeout_us)
+{
+	const uint32_t start = ARM_DWT_CYCCNT;
+	const uint32_t limit = us_to_cycles(timeout_us);
+	while ((USBHS_USBSTS & mask) != want) {
+		if (USBHS_USBSTS & USBHS_USBSTS_HCH) return false;
+		if (ARM_DWT_CYCCNT - start > limit) return false;
+	}
+	return true;
+}
+
+// Wait (bounded) until the periodic schedule has advanced past at least one full frame.
+static void wait_periodic_frame(void)
+{
+	if (!(USBHS_USBSTS & USBHS_USBSTS_PS)) return;
+	const uint32_t start = ARM_DWT_CYCCNT;
+	const uint32_t limit = us_to_cycles(3000);
+	uint32_t last = USBHS_FRINDEX;
+	uint32_t changes = 0;
+	while (changes < 9) {
+		if (USBHS_USBSTS & USBHS_USBSTS_HCH) return;
+		if (ARM_DWT_CYCCNT - start > limit) return;
+		uint32_t now = USBHS_FRINDEX;
+		if (now != last) {
+			last = now;
+			changes++;
+		}
+	}
+}
+
 void USBHost::begin()
 {
+	ARM_DEMCR |= ARM_DEMCR_TRCENA;
+	ARM_DWT_CTRL |= ARM_DWT_CTRL_CYCCNTENA;
 #if defined(__MK66FX1M0__)
 	// Teensy 3.6 has USB host power controlled by PTE6
 	PORTE_PCR6 = PORT_PCR_MUX(1);
@@ -328,6 +373,14 @@ void USBHost::isr()
 	if (stat & USBHS_USBSTS_TI1) println(" Timer1");
 #endif
 
+	if (stat & USBHS_USBSTS_SEI) {
+		println("USB host system error, controller halted");
+		system_error = true;
+	}
+	// errors first, so halted qTDs aren't consumed by the normal followup before the pipe is unhalted
+	if (stat & USBHS_USBSTS_UEI) {
+		followup_Error();
+	}
 	if (stat & USBHS_USBSTS_UAI) { // completed qTD(s) from the async schedule
 		//println("Async Followup");
 		//print(async_followup_first, async_followup_last);
@@ -362,9 +415,6 @@ void USBHost::isr()
 			}
 		}
 	}
-	if (stat & USBHS_USBSTS_UEI) {
-		followup_Error();
-	}
 
 	if (stat & USBHS_USBSTS_PCI) { // port change detected
 		const uint32_t portstat = USBHS_PORTSC1;
@@ -376,6 +426,14 @@ void USBHost::isr()
 		if (portstat & USBHS_PORTSC_CSC) {
 			if (portstat & USBHS_PORTSC_CCS) {
 				println("    connect");
+				if (port_state == PORT_STATE_ACTIVE) {
+					// replugged faster than the disconnect was seen
+					println("    reconnect while active");
+					USBPHY_CTRL_CLR = USBPHY_CTRL_ENHOSTDISCONDETECT;
+					disconnect_Device(rootdev);
+					rootdev = NULL;
+					port_state = PORT_STATE_DISCONNECTED;
+				}
 				if (port_state == PORT_STATE_DISCONNECTED
 				  || port_state == PORT_STATE_DEBOUNCE) {
 					// 100 ms debounce (USB 2.0: TATTDB, page 150 & 188)
@@ -488,6 +546,10 @@ void USBDriverTimer::start(uint32_t microseconds)
 #endif
 	if (!driver) return;
 	if (microseconds < 100) return; // minimum timer duration
+	bool irq_was_enabled = __irq_enabled();
+	__disable_irq();
+	// restarting an already queued timer would corrupt the list
+	stop();
 	started_micros = micros();
 	if (active_timers == NULL) {
 		// schedule is empty, just add this timer
@@ -497,6 +559,7 @@ void USBDriverTimer::start(uint32_t microseconds)
 		active_timers = this;
 		USBHS_GPTIMER1LD = microseconds - 1;
 		USBHS_GPTIMER1CTL = USBHS_GPTIMERCTL_RST | USBHS_GPTIMERCTL_RUN;
+		if (irq_was_enabled) __enable_irq();
 		return;
 	}
 	uint32_t remain = USBHS_GPTIMER1CTL & 0xFFFFFF;
@@ -504,8 +567,6 @@ void USBDriverTimer::start(uint32_t microseconds)
 	//USBHDBGSerial.println(remain);
 	if (microseconds < remain) {
 		// this timer event is before any on the schedule
-		bool irq_was_enabled = __irq_enabled();
-		__disable_irq();
 		USBHS_GPTIMER1CTL = 0;
 		USBHS_USBSTS = USBHS_USBSTS_TI1; // TODO: UPI & UAI safety?!
 		usec = microseconds;
@@ -532,6 +593,7 @@ void USBDriverTimer::start(uint32_t microseconds)
 			prev = list->prev;
 			list->prev = this;
 			prev->next = this;
+			if (irq_was_enabled) __enable_irq();
 			return;
 		}
 		microseconds -= list->usec;
@@ -541,6 +603,7 @@ void USBDriverTimer::start(uint32_t microseconds)
 	next = NULL;
 	prev = list;
 	list->next = this;
+	if (irq_was_enabled) __enable_irq();
 }
 
 void USBDriverTimer::stop()
@@ -561,6 +624,8 @@ void USBDriverTimer::stop()
 			} else {
 				active_timers = NULL;
 			}
+			next = NULL;
+			prev = NULL;
 		} else {
 			for (USBDriverTimer *t = active_timers->next; t; t = t->next) {
 				if (t == this) {
@@ -569,6 +634,8 @@ void USBDriverTimer::stop()
 						t->next->usec += t->usec;
 						t->next->prev = t->prev;
 					}
+					next = NULL;
+					prev = NULL;
 					break;
 				}
 			}
@@ -721,23 +788,30 @@ bool USBHost::queue_Control_Transfer(Device_t *dev, setup_t *setup, void *buf, U
 
 	//println("new_Control_Transfer");
 	if (setup->wLength > 16384) return false; // max 16K data for control
+	if (!dev || !dev->control_pipe) return false;
+	bool irq_was_enabled = NVIC_IS_ENABLED(IRQ_USBHS);
+	NVIC_DISABLE_IRQ(IRQ_USBHS);
 	transfer = allocate_Transfer();
 	if (!transfer) {
 		println("  error allocating setup transfer");
+		if (irq_was_enabled) NVIC_ENABLE_IRQ(IRQ_USBHS);
 		return false;
 	}
 	status = allocate_Transfer();
 	if (!status) {
 		println("  error allocating status transfer");
 		free_Transfer(transfer);
+		if (irq_was_enabled) NVIC_ENABLE_IRQ(IRQ_USBHS);
 		return false;
 	}
+	data = NULL;
 	if (setup->wLength > 0) {
 		data = allocate_Transfer();
 		if (!data) {
 			println("  error allocating data transfer");
 			free_Transfer(transfer);
 			free_Transfer(status);
+			if (irq_was_enabled) NVIC_ENABLE_IRQ(IRQ_USBHS);
 			return false;
 		}
 		uint32_t pid = (setup->bmRequestType & 0x80) ? 1 : 0;
@@ -759,7 +833,14 @@ bool USBHost::queue_Control_Transfer(Device_t *dev, setup_t *setup, void *buf, U
 	status->setup.word2 = setup->word2;
 	status->driver = driver;
 	status->qtd.next = 1;
-	return queue_Transfer(dev->control_pipe, transfer);
+	bool ok = queue_Transfer(dev->control_pipe, transfer);
+	if (!ok) {
+		free_Transfer(transfer);
+		if (data) free_Transfer(data);
+		free_Transfer(status);
+	}
+	if (irq_was_enabled) NVIC_ENABLE_IRQ(IRQ_USBHS);
+	return ok;
 }
 
 
@@ -776,6 +857,11 @@ bool USBHost::queue_Data_Transfer(Pipe_t *pipe, void *buffer, uint32_t len, USBD
 	// But only re-enable if it was enabled coming in. 
 	bool irq_was_enabled = NVIC_IS_ENABLED(IRQ_USBHS);
 	NVIC_DISABLE_IRQ(IRQ_USBHS);
+
+	if (!pipe) {
+		if (irq_was_enabled) NVIC_ENABLE_IRQ(IRQ_USBHS);
+		return false;
+	}
 
 	// TODO: option for zero length packet?  Maybe in Pipe_t fields?
 
@@ -827,6 +913,14 @@ bool USBHost::queue_Data_Transfer(Pipe_t *pipe, void *buffer, uint32_t len, USBD
 		data = (Transfer_t *)(data->qtd.next);
 	}
 	bool return_value = queue_Transfer(pipe, transfer);
+	if (!return_value) {
+		while (1) {
+			uint32_t n = transfer->qtd.next;
+			free_Transfer(transfer);
+			if (n == 1) break;
+			transfer = (Transfer_t *)n;
+		}
+	}
 	if (irq_was_enabled) NVIC_ENABLE_IRQ(IRQ_USBHS);
 	return return_value;
 }
@@ -843,13 +937,13 @@ bool USBHost::queue_Transfer(Pipe_t *pipe, Transfer_t *transfer)
 	}
 	// find halt qTD
 	Transfer_t *halt = (Transfer_t *)(pipe->qh.next);
-	if (halt==nullptr) {
+	if (((uint32_t)halt & ~0x1F) == 0) {
 		if (irq_was_enabled) __enable_irq();
 		return false;
 	}
 	while (!(halt->qtd.token & 0x40)) {
 		halt = (Transfer_t *)(halt->qtd.next);
-		if (halt==nullptr) {
+		if (((uint32_t)halt & ~0x1F) == 0) {
 			if (irq_was_enabled) __enable_irq();
 			return false;
 		}
@@ -928,12 +1022,20 @@ bool USBHost::followup_Transfer(Transfer_t *transfer)
 void USBHost::followup_Error(void)
 {
 	println("ERROR Followup");
-	Transfer_t *p = async_followup_first;
+	followup_Error_list(false);
+	followup_Error_list(true);
+}
+
+void USBHost::followup_Error_list(bool periodic)
+{
+	void (*remove_from_list)(Transfer_t *) = periodic ?
+		remove_from_periodic_followup_list : remove_from_async_followup_list;
+	Transfer_t *p = periodic ? periodic_followup_first : async_followup_first;
 	while (p) {
 		if (followup_Transfer(p)) {
 			// transfer completed
 			Transfer_t *next = p->next_followup;
-			remove_from_async_followup_list(p);
+			remove_from_list(p);
 			println("    remove from followup list");
 			if (p->qtd.token & 0x40) {
 				Pipe_t *haltedpipe = p->pipe;
@@ -948,12 +1050,13 @@ void USBHost::followup_Error(void)
 					Transfer_t *next2 = p->next_followup;
 					if (p->pipe == haltedpipe) {
 						println("    stray halted ", (uint32_t)p, HEX);
-						remove_from_async_followup_list(p);
+						remove_from_list(p);
 						if (first == NULL) {
 							first = p;
 							last = p;
 						} else {
 							last->next_followup = p;
+							last = p;
 						}
 						p->next_followup = NULL;
 						if (next == p) next = next2;
@@ -1007,7 +1110,6 @@ void USBHost::followup_Error(void)
 			p = p->next_followup;
 		}
 	}
-	// TODO: handle errors from periodic schedule!
 }
 
 static void add_to_async_followup_list(Transfer_t *first, Transfer_t *last)
@@ -1346,29 +1448,39 @@ void USBHost::delete_Pipe(Pipe_t *pipe)
 			// removing the only QH, so just shut down the async schedule
 			println("  shut down async schedule");
 			USBHS_USBCMD &= ~USBHS_USBCMD_ASE; // disable async schedule
-			while (USBHS_USBSTS & USBHS_USBSTS_AS) ; // busy loop wait
+			if (!wait_usbsts(USBHS_USBSTS_AS, 0, 5000)) println("  async disable timeout");
 			USBHS_ASYNCLISTADDR = 0;
 		} else {
 			// find the previous QH in the async schedule loop
 			println("  remove QH from async schedule");
 			Pipe_t *prev = next;
-			while (1) {
+			for (uint32_t guard = 0; ; guard++) {
 				Pipe_t *n = (Pipe_t *)(prev->qh.horizontal_link & 0xFFFFFFE0);
 				if (n == pipe) break;
+				if (n == NULL || n == next || guard > 256) {
+					// corrupt ring, or pipe not in it
+					prev = NULL;
+					break;
+				}
 				prev = n;
 			}
-			// if removing the one with H bit, set another
-			if (pipe->qh.capabilities[0] & 0x8000) {
-				prev->qh.capabilities[0] |= 0x8000; // set H bit
+			if (prev == NULL) {
+				println("  QH not found in async schedule");
+			} else {
+				// if removing the one with H bit, set another
+				if (pipe->qh.capabilities[0] & 0x8000) {
+					prev->qh.capabilities[0] |= 0x8000; // set H bit
+				}
+				// link the previous QH, we're no longer in the loop
+				prev->qh.horizontal_link = pipe->qh.horizontal_link;
+				// do the Async Advance Doorbell handshake to wait to be
+				// sure the EHCI no longer references the removed QH
+				if (USBHS_USBSTS & USBHS_USBSTS_AS) {
+					USBHS_USBCMD |= USBHS_USBCMD_IAA;
+					if (!wait_usbsts(USBHS_USBSTS_AAI, USBHS_USBSTS_AAI, 5000)) println("  IAA timeout");
+					USBHS_USBSTS = USBHS_USBSTS_AAI;
+				}
 			}
-			// link the previous QH, we're no longer in the loop
-			prev->qh.horizontal_link = pipe->qh.horizontal_link;
-			// do the Async Advance Doorbell handshake to wait to be
-			// sure the EHCI no longer references the removed QH
-			USBHS_USBCMD |= USBHS_USBCMD_IAA;
-			while (!(USBHS_USBSTS & USBHS_USBSTS_AAI)) ; // busy loop wait
-			USBHS_USBSTS = USBHS_USBSTS_AAI;
-			// TODO: does this write interfere UPI & UAI (bits 18 & 19) ??
 		}
 		// find & free all the transfers which completed
 		println("  Free transfers");
@@ -1407,7 +1519,7 @@ void USBHost::delete_Pipe(Pipe_t *pipe)
 				continue;
 			}
 			Pipe_t *prev = node;
-			while (1) {
+			for (uint32_t guard = 0; guard < 256; guard++) {
 				num = node->qh.horizontal_link;
 				if (num & 1) break;
 				node = (Pipe_t *)(num & 0xFFFFFFE0);
@@ -1418,6 +1530,8 @@ void USBHost::delete_Pipe(Pipe_t *pipe)
 				prev = node;
 			}
 		}
+		// the controller may still be using the QH within the current frame
+		wait_periodic_frame();
 		// subtract bandwidth from uframe_bandwidth array
 		if (pipe->device->speed == 2) {
 			uint32_t interval = pipe->bandwidth_interval;

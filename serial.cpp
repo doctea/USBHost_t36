@@ -450,6 +450,13 @@ bool USBSerialBase::init_buffers(uint32_t rsize, uint32_t tsize)
 
 void USBSerialBase::disconnect()
 {
+	txtimer.stop();
+	rxpipe = NULL;
+	txpipe = NULL;
+	rxstate = 0;
+	txstate = 0;
+	control_queued = false;
+	pending_control = 0;
 }
 
 
@@ -1073,7 +1080,7 @@ void USBSerialBase::rx_queue_packets(uint32_t head, uint32_t tail)
 		avail = tail - head - 1;
 	}
 	uint32_t packetsize = rx2 - rx1;
-	if (avail >= packetsize) {
+	if (avail >= packetsize && rxpipe) {
 		if ((rxstate & 0x01) == 0) {
 			queue_Data_Transfer(rxpipe, rx1, packetsize, this);
 			rxstate |= 0x01;
@@ -1145,13 +1152,24 @@ void USBSerialBase::tx_data(const Transfer_t *transfer)
 		tail = len - 1;
 	}
 	txtail = tail;
-	queue_Data_Transfer(txpipe, p, count, this);
+	if (!queue_Data_Transfer(txpipe, p, count, this)) txstate &= ~(mask | 4);
 	debugDigitalWrite(5, LOW);
+}
+
+// cycle-counter based, so it still times out when interrupts are blocked
+static inline uint32_t serial_ms_to_cycles(uint32_t ms)
+{
+#if defined(__IMXRT1052__) || defined(__IMXRT1062__)
+	return ms * (F_CPU_ACTUAL / 1000);
+#else
+	return ms * (F_CPU / 1000);
+#endif
 }
 
 void USBSerialBase::flush()
 {
 	print("USBSerialBase::flush");
+	if (!device || !txpipe) return;
  	if (txhead == txtail) {
  		println(" - Empty");
  		return;  // empty.
@@ -1162,7 +1180,13 @@ void USBSerialBase::flush()
 	txtimer.start(100);		// Start a mimimal timeout
 //	timer_event(nullptr);   // Try calling direct - fails to work 
 	NVIC_ENABLE_IRQ(IRQ_USBHS);
-	while (txstate & 3) ; // wait for all of the USB packets to be sent. 
+	const uint32_t start = ARM_DWT_CYCCNT;
+	while ((txstate & 3) && device) { // wait for all of the USB packets to be sent
+		if (ARM_DWT_CYCCNT - start > serial_ms_to_cycles(100)) {
+			println(" timeout");
+			break;
+		}
+	}
 	println(" completed");
  	debugDigitalWrite(32, LOW);
 }
@@ -1173,6 +1197,10 @@ void USBSerialBase::timer_event(USBDriverTimer *whichTimer)
 {
 	debugDigitalWrite(7, HIGH);
 	println("txtimer");
+	if (!txpipe) {
+		debugDigitalWrite(7, LOW);
+		return;
+	}
 	uint32_t count;
 	uint32_t head = txhead;
 	uint32_t tail = txtail;
@@ -1224,7 +1252,7 @@ void USBSerialBase::timer_event(USBDriverTimer *whichTimer)
 	print("  TX data (", count);
 	print(") ");
 	print_hexbytes(p, count);
-	queue_Data_Transfer(txpipe, p, count, this);
+	if (!queue_Data_Transfer(txpipe, p, count, this)) txstate &= ~((p == tx1) ? 1 : 2);
 	debugDigitalWrite(7, LOW);
 }
 
@@ -1330,8 +1358,13 @@ size_t USBSerialBase::write(uint8_t c)
 	if (!device) return 0;
 	uint32_t head = txhead;
 	if (++head >= txsize) head = 0;
-	while (txtail == head) {
-		// wait...
+	if (txtail == head) {
+		// buffer full: wait for it to drain, but give up if the device goes away or stalls
+		const uint32_t start = ARM_DWT_CYCCNT;
+		while (txtail == head) {
+			if (!device || !txpipe) return 0;
+			if (ARM_DWT_CYCCNT - start > serial_ms_to_cycles(50)) return 0;
+		}
 	}
 	txbuf[head] = c;
 	txhead = head;
@@ -1380,7 +1413,7 @@ size_t USBSerialBase::write(uint8_t c)
 			txtail = tail;
 			//println("queue tx packet, newtail=", tail);
 			debugDigitalWrite(7, HIGH);
-			queue_Data_Transfer(txpipe, p, packetsize, this);
+			if (!queue_Data_Transfer(txpipe, p, packetsize, this)) txstate &= ~((p == tx1) ? 1 : 2);
 			debugDigitalWrite(7, LOW);
 			NVIC_ENABLE_IRQ(IRQ_USBHS);
 			return 1;

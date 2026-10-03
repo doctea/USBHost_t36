@@ -361,6 +361,10 @@ void USBHub::new_port_status(uint32_t port, uint32_t status)
 	if (status & 0x1000) println("  Software Controls LEDs");
 #endif
 	uint8_t &state = portstate[port-1];
+	// change bits nothing else acknowledges, otherwise the hub keeps reporting them
+	if (status & 0x40000) send_clearstatus_suspend(port);
+	if (status & 0x80000) send_clearstatus_overcurrent(port);
+	if ((status & 0x100000) && state != PORT_RESET) send_clearstatus_reset(port);
 	switch (state) {
 	  case PORT_OFF:
 	  case PORT_DISCONNECT:
@@ -387,6 +391,8 @@ void USBHub::new_port_status(uint32_t port, uint32_t status)
 				stop_debounce_timer(port);
 				state = PORT_RESET;
 				println("sending reset");
+				// clear any connect change left over from bounces, so it isn't seen later as a replug
+				send_clearstatus_connect(port);
 				send_setreset(port);
 				port_doing_reset = port;
 			}
@@ -398,6 +404,7 @@ void USBHub::new_port_status(uint32_t port, uint32_t status)
 	  case PORT_RESET:
 		if (status & 0x0002) {
 			// port is now enabled
+			if (status & 0x10000) send_clearstatus_connect(port);
 			send_clearstatus_reset(port);
 			state = PORT_RECOVERY;
 			uint8_t speed=0;
@@ -408,13 +415,24 @@ void USBHub::new_port_status(uint32_t port, uint32_t status)
 		} else if (!(status & 0x0001)) {
 			send_clearstatus_connect(port);
 			USBHub::reset_busy = false;
+			port_doing_reset = 0;
 			state = PORT_DISCONNECT;
+		} else if (status & 0x100000) {
+			// reset finished but port not enabled, release the lock and retry
+			println("reset failed, retrying");
+			send_clearstatus_reset(port);
+			USBHub::reset_busy = false;
+			port_doing_reset = 0;
+			state = PORT_DEBOUNCE1;
+			start_debounce_timer(port);
 		}
 		break;
 	  case PORT_RECOVERY:
 		if (!(status & 0x0001)) {
 			send_clearstatus_connect(port);
+			resettimer.stop();
 			USBHub::reset_busy = false;
+			port_doing_reset = 0;
 			state = PORT_DISCONNECT;
 		}
 		break;
@@ -424,6 +442,15 @@ void USBHub::new_port_status(uint32_t port, uint32_t status)
 			devicelist[port-1] = NULL;
 			send_clearstatus_connect(port);
 			state = PORT_DISCONNECT;
+		} else if ((status & 0x10000) || ((status & 0x20000) && !(status & 0x0002))) {
+			// replugged before the disconnect was seen, or port disabled by an error
+			println("reconnect or port error while active");
+			disconnect_Device(devicelist[port-1]);
+			devicelist[port-1] = NULL;
+			if (status & 0x10000) send_clearstatus_connect(port);
+			if (status & 0x20000) send_clearstatus_enable(port);
+			state = PORT_DEBOUNCE1;
+			start_debounce_timer(port);
 		}
 		break;
 	}
@@ -491,6 +518,14 @@ void USBHub::stop_debounce_timer(uint32_t port)
 
 void USBHub::disconnect()
 {
+	debouncetimer.stop();
+	resettimer.stop();
+	// release the global reset lock if one of our ports held it
+	bool held_reset = (port_doing_reset != 0);
+	for (uint32_t i=0; i < numports && i < sizeof(portstate); i++) {
+		if (portstate[i] == PORT_RESET || portstate[i] == PORT_RECOVERY) held_reset = true;
+	}
+	if (held_reset) USBHub::reset_busy = false;
 	// disconnect all downstream devices, which may be more hubs
 	for (uint32_t i=0; i < numports; i++) {
 		if (devicelist[i]) disconnect_Device(devicelist[i]);
