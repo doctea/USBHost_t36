@@ -419,7 +419,7 @@ void USBHost::isr()
 	if (stat & USBHS_USBSTS_PCI) { // port change detected
 		const uint32_t portstat = USBHS_PORTSC1;
 		println("port change: ", portstat, HEX);
-		USBHS_PORTSC1 = portstat | (USBHS_PORTSC_OCC|USBHS_PORTSC_PEC|USBHS_PORTSC_CSC);
+		USBHS_PORTSC1 = portstat;
 		if (portstat & USBHS_PORTSC_OCC) {
 			println("  overcurrent change");
 		}
@@ -826,6 +826,9 @@ bool USBHost::queue_Control_Transfer(Device_t *dev, setup_t *setup, void *buf, U
 	//println("setup address ", (uint32_t)setup, HEX);
 	init_qTD(transfer, setup, 8, 2, 0, false);
 	init_qTD(status, NULL, 0, status_direction, 1, true);
+	if (data && !driver && dev->control_pipe->callback_function == &enumeration) {
+		data->qtd.alt_next = (uint32_t)status;
+	}
 	status->pipe = dev->control_pipe;
 	status->buffer = buf;
 	status->length = setup->wLength;
@@ -1004,6 +1007,14 @@ bool USBHost::followup_Transfer(Transfer_t *transfer)
 	//println("    token=", transfer->qtd.token, HEX);
 
 	if (!(transfer->qtd.token & 0x80)) {
+		if (!(transfer->qtd.token & 0x8000) && (transfer->qtd.token & 0x300) != 0x200) {
+			Transfer_t *status = transfer->next_followup;
+			if (status && (status->qtd.token & 0x8000) && !status->driver &&
+			    status->pipe->type == 0 && status->pipe->callback_function == &enumeration) {
+				uint32_t remaining = (transfer->qtd.token >> 16) & 0x7FFF;
+				status->length = (remaining <= status->length) ? status->length - remaining : 0;
+			}
+		}
 		// TODO: check error status
 		if (transfer->qtd.token & 0x8000) {
 			// this transfer caused an interrupt

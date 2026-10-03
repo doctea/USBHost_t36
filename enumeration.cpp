@@ -126,7 +126,10 @@ Device_t * USBHost::new_Device(uint32_t speed, uint32_t hub_addr, uint32_t hub_p
 	// Only a single device can enumerate at a time.
 	USBHost::enumeration_busy = true;
 	mk_setup(enumsetup, 0x80, 6, 0x0100, 0, 8); // 6=GET_DESCRIPTOR
-	queue_Control_Transfer(dev, &enumsetup, enumbuf, NULL);
+	if (!queue_Control_Transfer(dev, &enumsetup, enumbuf, NULL)) {
+		dev->enum_state = 15;
+		USBHost::enumeration_busy = false;
+	}
 	if (devlist == NULL) {
 		devlist = dev;
 	} else {
@@ -173,6 +176,19 @@ void USBHost::enumeration(const Transfer_t *transfer)
 		}
 	}
 
+	auto fail_enumeration = [dev]() {
+		println("enumeration failed, state=", dev->enum_state);
+		dev->enum_state = 15;
+		USBHost::enumeration_busy = false;
+	};
+	auto queue_next = [dev, &fail_enumeration](uint8_t state, void *buffer) {
+		dev->enum_state = state;
+		if (!queue_Control_Transfer(dev, &enumsetup, buffer, NULL)) fail_enumeration();
+	};
+	const uint32_t received = transfer->length;
+	const bool valid_string = received >= 2 && enumbuf[4] >= 2 &&
+		enumbuf[4] <= received && !(enumbuf[4] & 1) && enumbuf[5] == 3;
+
 	while (1) {
 		// Within this large switch/case, "break" means we've done
 		// some work, but more remains to be done in a different
@@ -183,19 +199,26 @@ void USBHost::enumeration(const Transfer_t *transfer)
 		// enumeration is complete and no more communication is needed.
 		switch (dev->enum_state) {
 		case 0: // read 8 bytes of device desc, set max packet, and send set address
+			if (received < 8 || enumbuf[0] != 18 || enumbuf[1] != 1 ||
+			    (enumbuf[7] != 8 && enumbuf[7] != 16 && enumbuf[7] != 32 && enumbuf[7] != 64)) {
+				fail_enumeration();
+				return;
+			}
 			pipe_set_maxlen(dev->control_pipe, enumbuf[7]);
 			mk_setup(enumsetup, 0, 5, assign_address(), 0, 0); // 5=SET_ADDRESS
-			queue_Control_Transfer(dev, &enumsetup, NULL, NULL);
-			dev->enum_state = 1;
+			queue_next(1, NULL);
 			return;
 		case 1: // request all 18 bytes of device descriptor
 			dev->address = enumsetup.wValue;
 			pipe_set_addr(dev->control_pipe, enumsetup.wValue);
 			mk_setup(enumsetup, 0x80, 6, 0x0100, 0, 18); // 6=GET_DESCRIPTOR
-			queue_Control_Transfer(dev, &enumsetup, enumbuf, NULL);
-			dev->enum_state = 2;
+			queue_next(2, enumbuf);
 			return;
 		case 2: // parse 18 device desc bytes
+			if (received < 18 || enumbuf[0] != 18 || enumbuf[1] != 1) {
+				fail_enumeration();
+				return;
+			}
 			print_device_descriptor(enumbuf);
 			dev->bDeviceClass = enumbuf[4];
 			dev->bDeviceSubClass = enumbuf[5];
@@ -214,11 +237,10 @@ void USBHost::enumeration(const Transfer_t *transfer)
 		case 3: // request Language ID
 			len = sizeof(enumbuf) - 4;
 			mk_setup(enumsetup, 0x80, 6, 0x0300, 0, len); // 6=GET_DESCRIPTOR
-			queue_Control_Transfer(dev, &enumsetup, enumbuf + 4, NULL);
-			dev->enum_state = 4;
+			queue_next(4, enumbuf + 4);
 			return;
 		case 4: // parse Language ID
-			if (enumbuf[4] < 4 || enumbuf[5] != 3) {
+			if (!valid_string || enumbuf[4] < 4) {
 				dev->enum_state = 11;
 			} else {
 				dev->LanguageID = enumbuf[6] | (enumbuf[7] << 8);
@@ -231,12 +253,13 @@ void USBHost::enumeration(const Transfer_t *transfer)
 		case 5: // request Manufacturer string
 			len = sizeof(enumbuf) - 4;
 			mk_setup(enumsetup, 0x80, 6, 0x0300 | enumbuf[0], dev->LanguageID, len);
-			queue_Control_Transfer(dev, &enumsetup, enumbuf + 4, NULL);
-			dev->enum_state = 6;
+			queue_next(6, enumbuf + 4);
 			return;
 		case 6: // parse Manufacturer string
-			print_string_descriptor("Manufacturer: ", enumbuf + 4);
-			convertStringDescriptorToASCIIString(0, dev, transfer);
+			if (valid_string) {
+				print_string_descriptor("Manufacturer: ", enumbuf + 4);
+				convertStringDescriptorToASCIIString(0, dev, transfer);
+			}
 			// TODO: receive the string...
 			if (enumbuf[1]) dev->enum_state = 7;
 			else if (enumbuf[2]) dev->enum_state = 9;
@@ -245,52 +268,66 @@ void USBHost::enumeration(const Transfer_t *transfer)
 		case 7: // request Product string
 			len = sizeof(enumbuf) - 4;
 			mk_setup(enumsetup, 0x80, 6, 0x0300 | enumbuf[1], dev->LanguageID, len);
-			queue_Control_Transfer(dev, &enumsetup, enumbuf + 4, NULL);
-			dev->enum_state = 8;
+			queue_next(8, enumbuf + 4);
 			return;
 		case 8: // parse Product string
-			print_string_descriptor("Product: ", enumbuf + 4);
-			convertStringDescriptorToASCIIString(1, dev, transfer);
+			if (valid_string) {
+				print_string_descriptor("Product: ", enumbuf + 4);
+				convertStringDescriptorToASCIIString(1, dev, transfer);
+			}
 			if (enumbuf[2]) dev->enum_state = 9;
 			else dev->enum_state = 11;
 			break;
 		case 9: // request Serial Number string
 			len = sizeof(enumbuf) - 4;
 			mk_setup(enumsetup, 0x80, 6, 0x0300 | enumbuf[2], dev->LanguageID, len);
-			queue_Control_Transfer(dev, &enumsetup, enumbuf + 4, NULL);
-			dev->enum_state = 10;
+			queue_next(10, enumbuf + 4);
 			return;
 		case 10: // parse Serial Number string
-			print_string_descriptor("Serial Number: ", enumbuf + 4);
-			convertStringDescriptorToASCIIString(2, dev, transfer);
+			if (valid_string) {
+				print_string_descriptor("Serial Number: ", enumbuf + 4);
+				convertStringDescriptorToASCIIString(2, dev, transfer);
+			}
 			dev->enum_state = 11;
 			break;
 		case 11: // request first 9 bytes of config desc
 			mk_setup(enumsetup, 0x80, 6, 0x0200, 0, 9); // 6=GET_DESCRIPTOR
-			queue_Control_Transfer(dev, &enumsetup, enumbuf, NULL);
-			dev->enum_state = 12;
+			queue_next(12, enumbuf);
 			return;
 		case 12: // read 9 bytes, request all of config desc
+			if (received < 9 || enumbuf[0] != 9 || enumbuf[1] != 2 ||
+			    (enumbuf[2] | (enumbuf[3] << 8)) < 9) {
+				fail_enumeration();
+				return;
+			}
 			enumlen = enumbuf[2] | (enumbuf[3] << 8);
 			println("Config data length = ", enumlen);
 			if (enumlen > sizeof(enumbuf)) {
 				enumlen = sizeof(enumbuf);
 				// TODO: how to handle device with too much config data
 			}
-			// a short read then leaves zeros, which claim_drivers treats as the end
 			memset(enumbuf, 0, enumlen);
 			mk_setup(enumsetup, 0x80, 6, 0x0200, 0, enumlen); // 6=GET_DESCRIPTOR
-			queue_Control_Transfer(dev, &enumsetup, enumbuf, NULL);
-			dev->enum_state = 13;
+			queue_next(13, enumbuf);
 			return;
 		case 13: // read all config desc, send set config
-			print_config_descriptor(enumbuf, sizeof(enumbuf));
+			if (received < enumlen || enumlen < 9 || enumbuf[0] != 9 || enumbuf[1] != 2 ||
+			    (enumbuf[2] | (enumbuf[3] << 8)) < enumlen) {
+				fail_enumeration();
+				return;
+			}
+			for (uint32_t offset = 9; offset < enumlen; offset += enumbuf[offset]) {
+				if (enumlen - offset < 2 || enumbuf[offset] < 2 || enumbuf[offset] > enumlen - offset) {
+					fail_enumeration();
+					return;
+				}
+			}
+			print_config_descriptor(enumbuf, enumlen);
 			dev->bmAttributes = enumbuf[7];
 			dev->bMaxPower = enumbuf[8];
 			// TODO: actually do something with interface descriptor?
 			mk_setup(enumsetup, 0, 9, enumbuf[5], 0, 0); // 9=SET_CONFIGURATION
-			queue_Control_Transfer(dev, &enumsetup, NULL, NULL);
-			dev->enum_state = 14;
+			queue_next(14, NULL);
 			return;
 		case 14: // device is now configured
 			claim_drivers(dev);
