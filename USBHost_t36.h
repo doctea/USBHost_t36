@@ -27,6 +27,10 @@
 #include <stdint.h>
 #include <FS.h>
 
+#ifndef USBHOST_MIDI_TX_QUEUE_SIZE
+#define USBHOST_MIDI_TX_QUEUE_SIZE 32
+#endif
+
 #if !defined(__MK66FX1M0__) && !defined(__IMXRT1052__) && !defined(__IMXRT1062__)
 #error "USBHost_t36 only works with Teensy 3.6 or Teensy 4.x.  Please select it in Tools > Boards"
 #endif
@@ -1217,6 +1221,29 @@ public:
     void sendNoteOn(uint8_t note, uint8_t velocity, uint8_t channel, uint8_t cable = 0) {
         send(0x90, note, velocity, channel, cable);
     }
+    bool trySendNoteOn(uint8_t note, uint8_t velocity, uint8_t channel, uint8_t cable = 0) {
+        return try_write_packed(0x9009 | ((cable & 0x0F) << 4)
+            | (((channel - 1) & 0x0F) << 8) | ((note & 0x7F) << 16)
+            | ((velocity & 0x7F) << 24));
+    }
+    bool beginTransmitQueues();
+    bool hasTransmitQueueStorage() const {
+        #ifdef USBHOST_MIDI_TX_QUEUE_ALLOCATOR
+        return tx_queue != nullptr && tx_realtime_queue != nullptr;
+        #else
+        return true;
+        #endif
+    }
+    uint32_t getTransmitDropCount() const { return tx_dropped; }
+    uint32_t getRealtimeTransmitDropCount() const { return tx_realtime_dropped; }
+    uint16_t getTransmitPendingCount() const {
+        bool irq_was_enabled = __irq_enabled();
+        __disable_irq();
+        uint16_t pending = tx_queue_count + tx_realtime_count;
+        if (irq_was_enabled) __enable_irq();
+        return pending;
+    }
+    uint8_t getRealtimeTransmitPendingCount() const { return tx_realtime_count; }
     void sendPolyPressure(uint8_t note, uint8_t pressure, uint8_t channel, uint8_t cable = 0) {
         send(0xA0, note, pressure, channel, cable);
     }
@@ -1330,6 +1357,8 @@ public:
         }
     }
     void send_now(void) __attribute__((always_inline)) {
+        drain_tx_queue();
+        flush_tx_buffers();
     }
     bool read(uint8_t channel = 0);
     uint8_t getType(void) {
@@ -1455,10 +1484,36 @@ protected:
     void tx_data(const Transfer_t *transfer);
     void init();
     void write_packed(uint32_t data);
+    bool try_write_packed(uint32_t data);
+    bool try_write_buffer(uint32_t data);
+    void drain_tx_queue();
+    void flush_tx_buffers();
     void send_sysex_buffer_has_term(const uint8_t *data, uint32_t length, uint8_t cable);
     void send_sysex_add_term_bytes(const uint8_t *data, uint32_t length, uint8_t cable);
     void sysex_byte(uint8_t b);
 private:
+    static_assert(USBHOST_MIDI_TX_QUEUE_SIZE > 0 && USBHOST_MIDI_TX_QUEUE_SIZE <= 65535,
+                  "USBHOST_MIDI_TX_QUEUE_SIZE must fit the nonzero 16-bit queue capacity");
+    static constexpr uint16_t TX_QUEUE_SIZE = USBHOST_MIDI_TX_QUEUE_SIZE;
+    #ifdef USBHOST_MIDI_TX_QUEUE_ALLOCATOR
+    uint32_t *tx_queue = nullptr;
+    #else
+    uint32_t tx_queue[TX_QUEUE_SIZE];
+    #endif
+    uint16_t tx_queue_head = 0;
+    uint16_t tx_queue_tail = 0;
+    volatile uint16_t tx_queue_count = 0;
+    volatile uint32_t tx_dropped = 0;
+    static constexpr uint8_t TX_REALTIME_QUEUE_SIZE = 16;
+    #ifdef USBHOST_MIDI_TX_QUEUE_ALLOCATOR
+    uint32_t *tx_realtime_queue = nullptr;
+    #else
+    uint32_t tx_realtime_queue[TX_REALTIME_QUEUE_SIZE];
+    #endif
+    uint8_t tx_realtime_head = 0;
+    uint8_t tx_realtime_tail = 0;
+    volatile uint8_t tx_realtime_count = 0;
+    volatile uint32_t tx_realtime_dropped = 0;
     Pipe_t *rxpipe;
     Pipe_t *txpipe;
     USBDriverTimer txtimer;

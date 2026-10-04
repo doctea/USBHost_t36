@@ -22,6 +22,7 @@
  */
 
 #include <Arduino.h>
+#include <stdlib.h>
 #include "USBHost_t36.h"  // Read this header first for key info
 
 #define print   USBHost::print_
@@ -275,6 +276,7 @@ void MIDIDeviceBase::tx_data(const Transfer_t *transfer)
 	} else if (transfer->buffer == tx_buffer2) {
 		tx2_count = 0;
 	}
+	drain_tx_queue();
 }
 
 
@@ -288,72 +290,163 @@ void MIDIDeviceBase::disconnect()
 	txpipe = NULL;
 	tx1_count = 0;
 	tx2_count = 0;
+	tx_queue_head = 0;
+	tx_queue_tail = 0;
+	tx_queue_count = 0;
+	tx_realtime_head = 0;
+	tx_realtime_tail = 0;
+	tx_realtime_count = 0;
 	rx_packet_queued = false;
 }
 
 
+bool MIDIDeviceBase::beginTransmitQueues()
+{
+	#ifdef USBHOST_MIDI_TX_QUEUE_ALLOCATOR
+	if (hasTransmitQueueStorage()) return true;
+	if (!__irq_enabled()) return false;
+	uint32_t *storage = static_cast<uint32_t *>(USBHOST_MIDI_TX_QUEUE_ALLOCATOR(
+		(TX_QUEUE_SIZE + TX_REALTIME_QUEUE_SIZE) * sizeof(uint32_t)));
+	if (!storage) return false;
+	tx_queue = storage;
+	tx_realtime_queue = storage + TX_QUEUE_SIZE;
+	#endif
+	return true;
+}
+
 void MIDIDeviceBase::write_packed(uint32_t data)
 {
-	if (!txpipe) return;
-	uint32_t tx_max = tx_size / 4;
-	uint32_t attempts = 0;
-	while (1 && attempts < 100000) {
-		bool irq_was_enabled = __irq_enabled();
-		__disable_irq();
-		if (!txpipe) {
-			if (irq_was_enabled) __enable_irq();
-			return;
+	bool irq_was_enabled = __irq_enabled();
+	__disable_irq();
+	bool realtime = (data & 0x0F) == 0x0F && ((data >> 8) & 0xFF) >= 0xF8;
+	if (txpipe && realtime) {
+		if (tx_realtime_count == 0 && try_write_buffer(data)) {
+			flush_tx_buffers();
+		} else if (hasTransmitQueueStorage() && tx_realtime_count < TX_REALTIME_QUEUE_SIZE) {
+			tx_realtime_queue[tx_realtime_head] = data;
+			tx_realtime_head = (tx_realtime_head + 1) % TX_REALTIME_QUEUE_SIZE;
+			tx_realtime_count++;
+			txtimer.start(tx_size >= 512 ? 200 : 1500);
+		} else {
+			tx_dropped++;
+			tx_realtime_dropped++;
 		}
+	} else if (txpipe && !try_write_packed(data)) {
+		if (hasTransmitQueueStorage() && tx_queue_count < TX_QUEUE_SIZE) {
+			tx_queue[tx_queue_head] = data;
+			tx_queue_head = (tx_queue_head + 1) % TX_QUEUE_SIZE;
+			tx_queue_count++;
+			txtimer.start(tx_size >= 512 ? 200 : 1500);
+		} else {
+			tx_dropped++;
+		}
+	}
+	if (irq_was_enabled) __enable_irq();
+}
+
+bool MIDIDeviceBase::try_write_packed(uint32_t data)
+{
+	bool irq_was_enabled = __irq_enabled();
+	__disable_irq();
+	bool accepted = tx_queue_count == 0 && tx_realtime_count == 0 && try_write_buffer(data);
+	if (irq_was_enabled) __enable_irq();
+	return accepted;
+}
+
+void MIDIDeviceBase::drain_tx_queue()
+{
+	bool irq_was_enabled = __irq_enabled();
+	__disable_irq();
+	for (uint8_t sent = 0; txpipe && (tx_queue_count || tx_realtime_count) && sent < 16; sent++) {
+		if (tx_realtime_count) {
+			if (!try_write_buffer(tx_realtime_queue[tx_realtime_tail])) break;
+			tx_realtime_tail = (tx_realtime_tail + 1) % TX_REALTIME_QUEUE_SIZE;
+			tx_realtime_count--;
+			flush_tx_buffers();
+		} else {
+			if (!try_write_buffer(tx_queue[tx_queue_tail])) break;
+			tx_queue_tail = (tx_queue_tail + 1) % TX_QUEUE_SIZE;
+			tx_queue_count--;
+		}
+	}
+	if (txpipe && (tx_queue_count || tx_realtime_count)) txtimer.start(tx_size >= 512 ? 200 : 1500);
+	if (irq_was_enabled) __enable_irq();
+}
+
+bool MIDIDeviceBase::try_write_buffer(uint32_t data)
+{
+	bool irq_was_enabled = __irq_enabled();
+	__disable_irq();
+	const uint32_t tx_max = txpipe ? tx_size / 4 : 0;
+	bool accepted = false;
+	if (txpipe && tx_max) {
 		uint32_t tx1 = tx1_count;
 		uint32_t tx2 = tx2_count;
+		uint32_t *buffer = NULL;
+		volatile uint8_t *count = NULL;
 		if (tx1 < tx_max && (tx2 == 0 || tx2 >= tx_max)) {
-			// use tx_buffer1
-			tx_buffer1[tx1++] = data;
-			tx1_count = tx1;
+			buffer = tx_buffer1;
+			count = &tx1_count;
+		} else if (tx2 < tx_max) {
+			buffer = tx_buffer2;
+			count = &tx2_count;
+		}
+		if (buffer) {
+			uint32_t previous = *count;
+			buffer[previous] = data;
+			*count = previous + 1;
 			txtimer.stop();
-			if (tx1 >= tx_max) {
-				if (!queue_Data_Transfer(txpipe, tx_buffer1, tx_max*4, this)) tx1_count = 0;
+			if (*count >= tx_max) {
+				accepted = queue_Data_Transfer(txpipe, buffer, tx_max*4, this);
+				if (!accepted) {
+					*count = previous;
+					txtimer.start(tx_max >= 128 ? 200 : 1500);
+				}
 			} else {
 				txtimer.start(tx_max >= 128 ? 200 : 1500);
+				accepted = true;
 			}
-			if (irq_was_enabled) __enable_irq();
-			return;
 		}
-		if (tx2 < tx_max) {
-			// use tx_buffer2
-			tx_buffer2[tx2++] = data;
-			tx2_count = tx2;
-			txtimer.stop();
-			if (tx2 >= tx_max) {
-				if (!queue_Data_Transfer(txpipe, tx_buffer2, tx_max*4, this)) tx2_count = 0;
-			} else {
-				txtimer.start(tx_max >= 128 ? 200 : 1500);
-			}
-			if (irq_was_enabled) __enable_irq();
-			return;
-		}
-		if (irq_was_enabled) __enable_irq();
-		// TODO: call yield() ??
-		//yield();
-
-		attempts++;
 	}
+	if (irq_was_enabled) __enable_irq();
+	return accepted;
 }
 
 void MIDIDeviceBase::timer_event(USBDriverTimer *timer)
 {
 	if (!txpipe) return;
+	drain_tx_queue();
+	flush_tx_buffers();
+}
+
+void MIDIDeviceBase::flush_tx_buffers()
+{
+	bool irq_was_enabled = __irq_enabled();
+	__disable_irq();
+	if (!txpipe) {
+		if (irq_was_enabled) __enable_irq();
+		return;
+	}
 	const uint32_t tx_max = tx_size / 4;
+	bool retry = false;
 	uint32_t tx1 = tx1_count;
 	if (tx1 > 0 && tx1 < tx_max) {
 		tx1_count = tx_max;
-		if (!queue_Data_Transfer(txpipe, tx_buffer1, tx1*4, this)) tx1_count = 0;
+		if (!queue_Data_Transfer(txpipe, tx_buffer1, tx1*4, this)) {
+			tx1_count = tx1;
+			retry = true;
+		}
 	}
 	uint32_t tx2 = tx2_count;
 	if (tx2 > 0 && tx2 < tx_max) {
 		tx2_count = tx_max;
-		if (!queue_Data_Transfer(txpipe, tx_buffer2, tx2*4, this)) tx2_count = 0;
+		if (!queue_Data_Transfer(txpipe, tx_buffer2, tx2*4, this)) {
+			tx2_count = tx2;
+			retry = true;
+		}
 	}
+	if (retry) txtimer.start(tx_max >= 128 ? 200 : 1500);
+	if (irq_was_enabled) __enable_irq();
 }
 
 void MIDIDeviceBase::send_sysex_buffer_has_term(const uint8_t *data, uint32_t length, uint8_t cable)
