@@ -73,6 +73,48 @@ void USBHost::Task()
 	}
 }
 
+uint32_t USBHost::getAsyncPipeDiagnostics(PipeDiagnosticInfo *info, uint32_t capacity)
+{
+	if (!info || !capacity) return 0;
+	const bool irq_enabled = __irq_enabled();
+	__disable_irq();
+	uint32_t count = 0;
+	auto capture = [&](const Pipe_t *pipe, const Device_t *device) {
+		if (!pipe || (pipe->type != 0 && pipe->type != 2) || count == capacity) return;
+		PipeDiagnosticInfo &sample = info[count++];
+		sample.address = reinterpret_cast<uintptr_t>(pipe);
+		sample.horizontal_link = pipe->qh.horizontal_link;
+		sample.current = pipe->qh.current;
+		sample.next = pipe->qh.next;
+		sample.dummy = reinterpret_cast<uintptr_t>(pipe->halt_transfer);
+		sample.capabilities1 = pipe->qh.capabilities[0];
+		sample.capabilities2 = pipe->qh.capabilities[1];
+		sample.token = pipe->qh.token;
+		sample.transfer_submissions = pipe->diagnostic_submissions;
+		sample.transfer_completions = pipe->diagnostic_completions;
+		sample.transfer_errors = pipe->diagnostic_errors;
+		sample.vid = device->idVendor;
+		sample.pid = device->idProduct;
+		sample.device_address = device->address;
+		sample.hub = device->hub_address;
+		sample.port = device->hub_port;
+		sample.speed = device->speed;
+		sample.type = pipe->type;
+		sample.direction = pipe->direction;
+	};
+	Device_t *device = devlist;
+	for (uint32_t guard = 0; device && guard < 64 && count < capacity; ++guard, device = device->next) {
+		capture(device->control_pipe, device);
+		Pipe_t *pipe = device->data_pipes;
+		for (uint32_t pipe_guard = 0; pipe && pipe_guard < 256 && count < capacity; ++pipe_guard, pipe = pipe->next) {
+			capture(pipe, device);
+		}
+	}
+	captureAsyncTransferDiagnostics(info, count);
+	if (irq_enabled) __enable_irq();
+	return count;
+}
+
 // Drivers call this after they've completed initialization, so get themselves
 // added to the list of inactive drivers available for new devices during
 // enumeraton.  Typically this is called from constructors, so hardware access
@@ -127,6 +169,7 @@ Device_t * USBHost::new_Device(uint32_t speed, uint32_t hub_addr, uint32_t hub_p
 	USBHost::enumeration_busy = true;
 	mk_setup(enumsetup, 0x80, 6, 0x0100, 0, 8); // 6=GET_DESCRIPTOR
 	if (!queue_Control_Transfer(dev, &enumsetup, enumbuf, NULL)) {
+		recordDiagnosticError(DiagnosticError::ControlQueue, dev);
 		dev->enum_state = 15;
 		USBHost::enumeration_busy = false;
 	}
@@ -170,20 +213,22 @@ void USBHost::enumeration(const Transfer_t *transfer)
 			// string descriptors are optional, devices may STALL them
 			dev->enum_state = 11;
 		} else {
+			recordDiagnosticError(DiagnosticError::EnumerationTransfer, dev, transfer->qtd.token);
 			dev->enum_state = 15;
 			USBHost::enumeration_busy = false;
 			return;
 		}
 	}
 
-	auto fail_enumeration = [dev]() {
+	auto fail_enumeration = [dev, transfer](DiagnosticError error = DiagnosticError::EnumerationDescriptor) {
 		println("enumeration failed, state=", dev->enum_state);
+		recordDiagnosticError(error, dev, error == DiagnosticError::ControlQueue ? 0 : transfer->length);
 		dev->enum_state = 15;
 		USBHost::enumeration_busy = false;
 	};
 	auto queue_next = [dev, &fail_enumeration](uint8_t state, void *buffer) {
 		dev->enum_state = state;
-		if (!queue_Control_Transfer(dev, &enumsetup, buffer, NULL)) fail_enumeration();
+		if (!queue_Control_Transfer(dev, &enumsetup, buffer, NULL)) fail_enumeration(DiagnosticError::ControlQueue);
 	};
 	const uint32_t received = transfer->length;
 	const bool valid_string = received >= 2 && enumbuf[4] >= 2 &&

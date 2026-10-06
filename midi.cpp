@@ -268,6 +268,11 @@ void MIDIDeviceBase::rx_data(const Transfer_t *transfer)
 
 void MIDIDeviceBase::tx_data(const Transfer_t *transfer)
 {
+	if (transfer->qtd.token & 0x7F) {
+		if (tx_transfer_errors_ != UINT32_MAX) ++tx_transfer_errors_;
+	} else if (tx_transfers_completed_ != UINT32_MAX) {
+		++tx_transfers_completed_;
+	}
 	println("MIDIDevice transmit complete");
 	print("  MIDI Data: ");
 	print_hexbytes(transfer->buffer, tx_size);
@@ -401,6 +406,8 @@ bool MIDIDeviceBase::try_write_buffer(uint32_t data)
 				if (!accepted) {
 					*count = previous;
 					txtimer.start(tx_max >= 128 ? 200 : 1500);
+				} else if (tx_transfers_submitted_ != UINT32_MAX) {
+					++tx_transfers_submitted_;
 				}
 			} else {
 				txtimer.start(tx_max >= 128 ? 200 : 1500);
@@ -415,6 +422,7 @@ bool MIDIDeviceBase::try_write_buffer(uint32_t data)
 void MIDIDeviceBase::timer_event(USBDriverTimer *timer)
 {
 	if (!txpipe) return;
+	if (tx_timer_callbacks_ != UINT32_MAX) ++tx_timer_callbacks_;
 	drain_tx_queue();
 	flush_tx_buffers();
 }
@@ -435,6 +443,8 @@ void MIDIDeviceBase::flush_tx_buffers()
 		if (!queue_Data_Transfer(txpipe, tx_buffer1, tx1*4, this)) {
 			tx1_count = tx1;
 			retry = true;
+		} else if (tx_transfers_submitted_ != UINT32_MAX) {
+			++tx_transfers_submitted_;
 		}
 	}
 	uint32_t tx2 = tx2_count;
@@ -443,6 +453,8 @@ void MIDIDeviceBase::flush_tx_buffers()
 		if (!queue_Data_Transfer(txpipe, tx_buffer2, tx2*4, this)) {
 			tx2_count = tx2;
 			retry = true;
+		} else if (tx_transfers_submitted_ != UINT32_MAX) {
+			++tx_transfers_submitted_;
 		}
 	}
 	if (retry) txtimer.start(tx_max >= 128 ? 200 : 1500);

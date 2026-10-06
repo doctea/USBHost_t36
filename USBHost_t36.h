@@ -242,12 +242,15 @@ struct Pipe_struct {
     uint16_t bandwidth_shift;
     uint8_t  bandwidth_stime;
     uint8_t  bandwidth_ctime;
-    uint32_t unused1;
-    uint32_t unused2;
-    uint32_t unused3;
-    uint32_t unused4;
+    Transfer_t *halt_transfer;
+    volatile uint32_t diagnostic_submissions;
+    volatile uint32_t diagnostic_completions;
+    volatile uint32_t diagnostic_errors;
     uint32_t unused5;
 };
+
+static_assert(sizeof(void *) != 4 || sizeof(Pipe_t) % 32 == 0,
+    "USB pipe pool stride must preserve 32-byte QH alignment");
 
 // Transfer_t represents a single transaction on the USB bus.
 // The first portion is an EHCI qTD structure.  Transfer_t are
@@ -286,12 +289,91 @@ struct Transfer_struct {
 
 class USBHost {
 public:
+    enum class DiagnosticError : uint8_t {
+        None, DevicePool, PipePool, TransferPool, EnumerationTransfer,
+        EnumerationDescriptor, ControlQueue, SystemError,
+        DevicePoolCorruption, PipePoolCorruption, TransferPoolCorruption, StringPoolCorruption,
+        TransferDoubleFree, EndpointTransfer
+    };
+    struct DiagnosticInfo {
+        uint32_t count;
+        uint32_t at_ms;
+        uint32_t detail;
+        uint16_t vid;
+        uint16_t pid;
+        DiagnosticError error;
+        uint8_t state;
+        uint8_t address;
+        uint8_t hub;
+        uint8_t port;
+        bool previous_boot;
+    };
+    static DiagnosticInfo getDiagnosticInfo();
+    static void clearDiagnosticInfo();
+    static const char *diagnosticErrorName(DiagnosticError error);
+    enum class DiagnosticPhase : uint8_t {
+        None, Loop, USBTask, PCUSBRead, BehaviourReads, BehaviourLoops,
+        MIDIReconnect, SerialReconnect, MenuInputs, MenuDisplay, CVInputs,
+        APCDisplay, Keyboard, LoopComplete, RetentionTest,
+        SerialIO, ClockUpdate, GateUpdate, TapTempo, ViewerCommands,
+        CVClock, ClockTicks, MenuTicks
+    };
+    struct DiagnosticProgress {
+        uint32_t at_ms;
+        DiagnosticPhase phase;
+    };
+    static void beginDiagnosticProgress();
+    static void setDiagnosticPhase(DiagnosticPhase phase);
+    static DiagnosticProgress getPreviousDiagnosticProgress();
+    static const char *diagnosticPhaseName(DiagnosticPhase phase);
+    struct ControllerDiagnosticInfo {
+        uint32_t command;
+        uint32_t status;
+        uint32_t interrupt_enable;
+        uint32_t frame_index;
+        uint32_t async_address;
+        uintptr_t async_software_head;
+        uint32_t port_status;
+        bool enumerating;
+    };
+    static ControllerDiagnosticInfo getControllerDiagnosticInfo();
+    struct PipeDiagnosticInfo {
+        uintptr_t address;
+        uintptr_t horizontal_link;
+        uintptr_t current;
+        uintptr_t next;
+        uintptr_t dummy;
+        uint32_t capabilities1;
+        uint32_t capabilities2;
+        uint32_t token;
+        uint32_t transfer_submissions;
+        uint32_t transfer_completions;
+        uint32_t transfer_errors;
+        uint32_t pending_count;
+        uint32_t active_count;
+        uintptr_t first_pending;
+        uintptr_t first_pending_next;
+        uint32_t first_pending_token;
+        bool next_is_pending;
+        bool followup_truncated;
+        uint16_t vid;
+        uint16_t pid;
+        uint8_t device_address;
+        uint8_t hub;
+        uint8_t port;
+        uint8_t speed;
+        uint8_t type;
+        uint8_t direction;
+    };
+    static uint32_t getAsyncPipeDiagnostics(PipeDiagnosticInfo *info, uint32_t capacity);
     static void begin();
     static void Task();
     static void countFree(uint32_t &devices, uint32_t &pipes, uint32_t &trans, uint32_t &strs);
     // true once the EHCI has reported a host system error (controller halts)
     static bool hadSystemError() { return system_error; }
 protected:
+    static void recordDiagnosticError(DiagnosticError error, const Device_t *device = nullptr,
+                                      uint32_t detail = 0);
     static Pipe_t * new_Pipe(Device_t *dev, uint32_t type, uint32_t endpoint,
                              uint32_t direction, uint32_t maxlen, uint32_t interval = 0);
     static bool queue_Control_Transfer(Device_t *dev, setup_t *setup,
@@ -310,6 +392,7 @@ public: // Maybe others may want/need to contribute memory example HID devices m
     static void contribute_String_Buffers(strbuf_t *strbuf, uint32_t num);
 private:
     static void isr();
+    static void captureAsyncTransferDiagnostics(PipeDiagnosticInfo *info, uint32_t count);
     static void convertStringDescriptorToASCIIString(uint8_t string_index, Device_t *dev, const Transfer_t *transfer);
     static void claim_drivers(Device_t *dev);
     static uint32_t assign_address(void);
@@ -628,6 +711,24 @@ public:
     // hubs to have up to 255 ports, in practice all hub chips on the
     // market are only 2, 3, 4 or 7 ports.
     enum { MAXPORTS = 7 };
+    struct PortDiagnosticInfo {
+        uint32_t status;
+        uint16_t vid;
+        uint16_t pid;
+        uint8_t state;
+        uint8_t address;
+        uint8_t enumeration_state;
+        bool has_device;
+    };
+    struct HubDiagnosticInfo {
+        uint32_t change_bits;
+        uint8_t port_count;
+        uint8_t reset_port;
+        bool change_pipe_present;
+        PortDiagnosticInfo ports[MAXPORTS];
+    };
+    HubDiagnosticInfo getPortDiagnostics() const;
+    virtual void Task();
     typedef uint8_t portbitmask_t;
     enum {
         PORT_OFF =        0,
@@ -648,6 +749,7 @@ protected:
     virtual void disconnect();
     void init();
     bool can_send_control_now();
+    bool queue_port_control(void *buffer);
     void send_poweron(uint32_t port);
     void send_getstatus(uint32_t port);
     void send_clearstatus_connect(uint32_t port);
@@ -688,6 +790,7 @@ private:
     uint8_t  port_doing_reset;
     uint8_t  port_doing_reset_speed;
     uint8_t  portstate[MAXPORTS];
+    uint32_t port_status[MAXPORTS];
     portbitmask_t send_pending_poweron;
     portbitmask_t send_pending_getstatus;
     portbitmask_t send_pending_clearstatus_connect;
@@ -1186,6 +1289,17 @@ private:
 class MIDIDeviceBase : public USBDriver {
 public:
     enum { SYSEX_MAX_LEN = 290 };
+    struct TransmitDiagnosticInfo {
+        uint32_t timer_callbacks;
+        uint32_t submissions;
+        uint32_t completions;
+        uint32_t errors;
+        uint16_t queued;
+        uint8_t realtime_queued;
+        uint8_t buffer1_count;
+        uint8_t buffer2_count;
+        uint8_t packet_capacity;
+    };
 
     // Message type names for compatibility with Arduino MIDI library 4.3.1
     enum MidiType {
@@ -1244,6 +1358,17 @@ public:
         return pending;
     }
     uint8_t getRealtimeTransmitPendingCount() const { return tx_realtime_count; }
+    TransmitDiagnosticInfo getTransmitDiagnosticInfo() const {
+        const bool irq_was_enabled = __irq_enabled();
+        __disable_irq();
+        TransmitDiagnosticInfo info = {
+            tx_timer_callbacks_, tx_transfers_submitted_, tx_transfers_completed_,
+            tx_transfer_errors_, tx_queue_count, tx_realtime_count, tx1_count,
+            tx2_count, static_cast<uint8_t>(tx_size / 4)
+        };
+        if (irq_was_enabled) __enable_irq();
+        return info;
+    }
     void sendPolyPressure(uint8_t note, uint8_t pressure, uint8_t channel, uint8_t cable = 0) {
         send(0xA0, note, pressure, channel, cable);
     }
@@ -1504,6 +1629,10 @@ private:
     uint16_t tx_queue_tail = 0;
     volatile uint16_t tx_queue_count = 0;
     volatile uint32_t tx_dropped = 0;
+    volatile uint32_t tx_timer_callbacks_ = 0;
+    volatile uint32_t tx_transfers_submitted_ = 0;
+    volatile uint32_t tx_transfers_completed_ = 0;
+    volatile uint32_t tx_transfer_errors_ = 0;
     static constexpr uint8_t TX_REALTIME_QUEUE_SIZE = 16;
     #ifdef USBHOST_MIDI_TX_QUEUE_ALLOCATOR
     uint32_t *tx_realtime_queue = nullptr;

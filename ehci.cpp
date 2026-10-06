@@ -80,6 +80,7 @@ static Device_t   *rootdev=NULL;
 // in memory.
 static Transfer_t *async_followup_first=NULL;
 static Transfer_t *async_followup_last=NULL;
+static Pipe_t *async_pipe_head=NULL;
 
 // List of all queued transfers in the asychronous schedule (interrupt endpoints)
 // When the EHCI completes these transfers, this list is how we locate them
@@ -105,6 +106,60 @@ static void remove_from_periodic_followup_list(Transfer_t *transfer);
 #define println USBHost::println_
 
 volatile bool USBHost::system_error = false;
+
+USBHost::ControllerDiagnosticInfo USBHost::getControllerDiagnosticInfo()
+{
+	const bool irq_enabled = __irq_enabled();
+	__disable_irq();
+	ControllerDiagnosticInfo info;
+	info.command = USBHS_USBCMD;
+	info.status = USBHS_USBSTS;
+	info.interrupt_enable = USBHS_USBINTR;
+	info.frame_index = USBHS_FRINDEX;
+	info.async_address = USBHS_ASYNCLISTADDR;
+	info.async_software_head = reinterpret_cast<uintptr_t>(async_pipe_head);
+	info.port_status = USBHS_PORTSC1;
+	info.enumerating = enumeration_busy;
+	if (irq_enabled) __enable_irq();
+	return info;
+}
+
+void USBHost::captureAsyncTransferDiagnostics(PipeDiagnosticInfo *info, uint32_t count)
+{
+	for (uint32_t index = 0; index < count; ++index) {
+		PipeDiagnosticInfo &sample = info[index];
+		sample.pending_count = 0;
+		sample.active_count = 0;
+		sample.first_pending = 0;
+		sample.first_pending_next = 0;
+		sample.first_pending_token = 0;
+		sample.next_is_pending = false;
+		sample.followup_truncated = false;
+	}
+	const Transfer_t *transfer = async_followup_first;
+	for (uint32_t guard = 0; transfer && guard < 256; ++guard, transfer = transfer->next_followup) {
+		const uintptr_t pipe_address = reinterpret_cast<uintptr_t>(transfer->pipe);
+		const uintptr_t transfer_address = reinterpret_cast<uintptr_t>(transfer);
+		const uint32_t token = transfer->qtd.token;
+		for (uint32_t index = 0; index < count; ++index) {
+			PipeDiagnosticInfo &sample = info[index];
+			if (sample.address != pipe_address) continue;
+			if (!sample.pending_count) {
+				sample.first_pending = transfer_address;
+				sample.first_pending_next = transfer->qtd.next;
+				sample.first_pending_token = token;
+			}
+			++sample.pending_count;
+			if (token & 0x80) ++sample.active_count;
+			if (!(sample.next & 1) && (sample.next & ~uintptr_t(31)) == transfer_address) {
+				sample.next_is_pending = true;
+			}
+		}
+	}
+	if (transfer) {
+		for (uint32_t index = 0; index < count; ++index) info[index].followup_truncated = true;
+	}
+}
 
 // Busy-waits use the cycle counter: micros() stops advancing while SysTick is blocked (eg in the USB ISR).
 static inline uint32_t us_to_cycles(uint32_t us)
@@ -269,6 +324,7 @@ void USBHost::begin()
 	println(" reset waited ", reset_count);
 
 	init_Device_Pipe_Transfer_memory();
+	async_pipe_head = NULL;
 	for (int i=0; i < PERIODIC_LIST_SIZE; i++) {
 		periodictable[i] = 1;
 	}
@@ -376,6 +432,7 @@ void USBHost::isr()
 	if (stat & USBHS_USBSTS_SEI) {
 		println("USB host system error, controller halted");
 		system_error = true;
+		recordDiagnosticError(DiagnosticError::SystemError, nullptr, stat);
 	}
 	// errors first, so halted qTDs aren't consumed by the normal followup before the pipe is unhalted
 	if (stat & USBHS_USBSTS_UEI) {
@@ -694,6 +751,7 @@ Pipe_t * USBHost::new_Pipe(Device_t *dev, uint32_t type, uint32_t endpoint,
 	halt->qtd.token = 0x40;
 	pipe->device = dev;
 	pipe->qh.next = (uint32_t)halt;
+	pipe->halt_transfer = halt;
 	pipe->qh.alt_next = 1;
 	pipe->direction = direction;
 	pipe->type = type;
@@ -732,10 +790,11 @@ Pipe_t * USBHost::new_Pipe(Device_t *dev, uint32_t type, uint32_t endpoint,
 
 	if (type == 0 || type == 2) {
 		// control or bulk: add to async queue
-		Pipe_t *list = (Pipe_t *)USBHS_ASYNCLISTADDR;
+		Pipe_t *list = async_pipe_head;
 		if (list == NULL) {
 			pipe->qh.capabilities[0] |= 0x8000; // H bit
 			pipe->qh.horizontal_link = (uint32_t)&(pipe->qh) | 2; // 2=QH
+			async_pipe_head = pipe;
 			USBHS_ASYNCLISTADDR = (uint32_t)&(pipe->qh);
 			USBHS_USBCMD |= USBHS_USBCMD_ASE; // enable async schedule
 			//println("  first in async list");
@@ -762,12 +821,19 @@ Pipe_t * USBHost::new_Pipe(Device_t *dev, uint32_t type, uint32_t endpoint,
 //   data01  value of DATA0/DATA1 toggle on 1st packet
 //   irq     whether to generate an interrupt when transfer complete
 //
+#ifndef USBHOST_T36_QTD_CERR
+#define USBHOST_T36_QTD_CERR 0
+#endif
+static_assert(USBHOST_T36_QTD_CERR >= 0 && USBHOST_T36_QTD_CERR <= 3,
+              "USBHOST_T36_QTD_CERR must be between 0 and 3");
+
 static void init_qTD(volatile Transfer_t *t, void *buf, uint32_t len,
               uint32_t pid, uint32_t data01, bool irq)
 {
 	t->qtd.alt_next = 1; // 1=terminate
 	if (data01) data01 = 0x80000000;
-	t->qtd.token = data01 | (len << 16) | (irq ? 0x8000 : 0) | (pid << 8) | 0x80;
+	t->qtd.token = data01 | (len << 16) | (irq ? 0x8000 : 0) | (pid << 8) |
+	              (USBHOST_T36_QTD_CERR << 10) | 0x80;
 	uint32_t addr = (uint32_t)buf;
 	t->qtd.buffer[0] = addr;
 	addr &= 0xFFFFF000;
@@ -939,17 +1005,10 @@ bool USBHost::queue_Transfer(Pipe_t *pipe, Transfer_t *transfer)
 		return false;
 	}
 	// find halt qTD
-	Transfer_t *halt = (Transfer_t *)(pipe->qh.next);
-	if (((uint32_t)halt & ~0x1F) == 0) {
+	Transfer_t *halt = pipe->halt_transfer;
+	if (halt == nullptr) {
 		if (irq_was_enabled) __enable_irq();
 		return false;
-	}
-	while (!(halt->qtd.token & 0x40)) {
-		halt = (Transfer_t *)(halt->qtd.next);
-		if (((uint32_t)halt & ~0x1F) == 0) {
-			if (irq_was_enabled) __enable_irq();
-			return false;
-		}
 	}
 	// transfer's token
 	uint32_t token = transfer->qtd.token;
@@ -979,11 +1038,13 @@ bool USBHost::queue_Transfer(Pipe_t *pipe, Transfer_t *transfer)
 	Transfer_t *p = halt;
 	while (p->qtd.next != (uint32_t)transfer) {
 		Transfer_t *next = (Transfer_t *)p->qtd.next;
+		p->pipe = pipe;
 		p->prev_followup = prev;
 		p->next_followup = next;
 		prev = p;
 		p = next;
 	}
+	p->pipe = pipe;
 	p->prev_followup = prev;
 	p->next_followup = NULL;
 	//print(halt, p);
@@ -995,8 +1056,12 @@ bool USBHost::queue_Transfer(Pipe_t *pipe, Transfer_t *transfer)
 		// interrupt
 		add_to_periodic_followup_list(halt, p);
 	}
+	pipe->halt_transfer = transfer;
 	// old halt becomes new transfer, this commits all new qTDs to QH
 	halt->qtd.token = token;
+	if (pipe->diagnostic_submissions != UINT32_MAX) {
+		++pipe->diagnostic_submissions;
+	}
 	if (irq_was_enabled) __enable_irq();
 	return true;
 }
@@ -1017,6 +1082,13 @@ bool USBHost::followup_Transfer(Transfer_t *transfer)
 		}
 		// TODO: check error status
 		if (transfer->qtd.token & 0x8000) {
+			if (transfer->qtd.token & 0x7F) {
+				if (transfer->pipe->diagnostic_errors != UINT32_MAX) {
+					++transfer->pipe->diagnostic_errors;
+				}
+			} else if (transfer->pipe->diagnostic_completions != UINT32_MAX) {
+				++transfer->pipe->diagnostic_completions;
+			}
 			// this transfer caused an interrupt
 			if (transfer->pipe->callback_function) {
 				// do the callback
@@ -1043,19 +1115,36 @@ void USBHost::followup_Error_list(bool periodic)
 		remove_from_periodic_followup_list : remove_from_async_followup_list;
 	Transfer_t *p = periodic ? periodic_followup_first : async_followup_first;
 	while (p) {
-		if (followup_Transfer(p)) {
+		if ((p->qtd.token & 0xC0) == 0x40) {
+			if (p->pipe->diagnostic_errors != UINT32_MAX) {
+				++p->pipe->diagnostic_errors;
+			}
+			bool driver_transfer = p->pipe->callback_function != &enumeration;
+			if (!driver_transfer) {
+				const Transfer_t *completion = p;
+				while (completion && completion->pipe == p->pipe && !(completion->qtd.token & 0x8000)) {
+					completion = completion->next_followup;
+				}
+				driver_transfer = completion && completion->pipe == p->pipe && completion->driver;
+			}
+			if (driver_transfer) {
+				recordDiagnosticError(DiagnosticError::EndpointTransfer, p->pipe->device, p->qtd.token);
+			}
+		}
+		if ((p->qtd.token & 0xC0) == 0x40 || followup_Transfer(p)) {
 			// transfer completed
 			Transfer_t *next = p->next_followup;
 			remove_from_list(p);
 			println("    remove from followup list");
 			if (p->qtd.token & 0x40) {
 				Pipe_t *haltedpipe = p->pipe;
-				free_Transfer(p);
+				uint32_t halted_status = p->qtd.token & 0x7F;
 				// traverse the rest of the list for unfinished work
 				// from this halted pipe.  Remove from the followup
 				// list and put onto our own temporary list
-				Transfer_t *first = NULL;
-				Transfer_t *last = NULL;
+				Transfer_t *first = p;
+				Transfer_t *last = p;
+				p->next_followup = NULL;
 				p = next;
 				while (p) {
 					Transfer_t *next2 = p->next_followup;
@@ -1076,13 +1165,7 @@ void USBHost::followup_Error_list(bool periodic)
 				}
 				// halted pipe (probably) still has unfinished transfers
 				// find the halted pipe's dummy halt transfer
-				p = (Transfer_t *)(haltedpipe->qh.next & ~0x1F);
-				while (p && ((p->qtd.token & 0x40) == 0)) {
-					print("  qtd: ", (uint32_t)p, HEX);
-					print(", token=", (uint32_t)p->qtd.token, HEX);
-					println(", next=", (uint32_t)p->qtd.next, HEX);
-					p = (Transfer_t *)(p->qtd.next & ~0x1F);
-				}
+				p = haltedpipe->halt_transfer;
 				if (p) {
 					// unhalt the pipe, "forget" unfinished transfers
 					// hopefully they're all on the list we made!
@@ -1104,7 +1187,7 @@ void USBHost::followup_Error_list(bool periodic)
 					uint32_t token = p->qtd.token;
 					if (token & 0x8000 && haltedpipe->callback_function) {
 						// driver expects a callback
-						p->qtd.token = token | 0x40;
+						p->qtd.token = (token & ~0xFFu) | halted_status;
 						(*(p->pipe->callback_function))(p);
 					}
 					Transfer_t *next2 = p->next_followup;
@@ -1461,6 +1544,7 @@ void USBHost::delete_Pipe(Pipe_t *pipe)
 			USBHS_USBCMD &= ~USBHS_USBCMD_ASE; // disable async schedule
 			if (!wait_usbsts(USBHS_USBSTS_AS, 0, 5000)) println("  async disable timeout");
 			USBHS_ASYNCLISTADDR = 0;
+			async_pipe_head = NULL;
 		} else {
 			// find the previous QH in the async schedule loop
 			println("  remove QH from async schedule");
@@ -1482,6 +1566,7 @@ void USBHost::delete_Pipe(Pipe_t *pipe)
 				if (pipe->qh.capabilities[0] & 0x8000) {
 					prev->qh.capabilities[0] |= 0x8000; // set H bit
 				}
+				if (async_pipe_head == pipe) async_pipe_head = prev;
 				// link the previous QH, we're no longer in the loop
 				prev->qh.horizontal_link = pipe->qh.horizontal_link;
 				// do the Async Advance Doorbell handshake to wait to be
@@ -1502,18 +1587,7 @@ void USBHost::delete_Pipe(Pipe_t *pipe)
 			if (t->pipe == pipe) {
 				print(" * remove");
 				remove_from_async_followup_list(t);
-
-				// Only free if not in QH list
-				Transfer_t *tr = (Transfer_t *)(pipe->qh.next);
-				while (((uint32_t)tr & 0xFFFFFFE0) && (tr != t)){
-					tr  = (Transfer_t *)(tr->qtd.next);
-				}
-				if (tr == t) {
-					println(" * defer free until QH");
-				} else {
-					println(" * free");
-					free_Transfer(t);  // The later code should actually free it...
-				}
+				free_Transfer(t);
 			} else {
 				println("");
 			}
@@ -1525,8 +1599,12 @@ void USBHost::delete_Pipe(Pipe_t *pipe)
 			uint32_t num = periodictable[i];
 			if (num & 1) continue;
 			Pipe_t *node = (Pipe_t *)(num & 0xFFFFFFE0);
+			if (node == nullptr) {
+				periodictable[i] = 1;
+				continue;
+			}
 			if (node == pipe) {
-				periodictable[i] = pipe->qh.horizontal_link;
+				periodictable[i] = pipe->qh.horizontal_link ? pipe->qh.horizontal_link : 1;
 				continue;
 			}
 			Pipe_t *prev = node;
@@ -1534,8 +1612,12 @@ void USBHost::delete_Pipe(Pipe_t *pipe)
 				num = node->qh.horizontal_link;
 				if (num & 1) break;
 				node = (Pipe_t *)(num & 0xFFFFFFE0);
+				if (node == nullptr) {
+					prev->qh.horizontal_link = 1;
+					break;
+				}
 				if (node == pipe) {
-					prev->qh.horizontal_link = node->qh.horizontal_link;
+					prev->qh.horizontal_link = node->qh.horizontal_link ? node->qh.horizontal_link : 1;
 					break;
 				}
 				prev = node;
@@ -1575,36 +1657,16 @@ void USBHost::delete_Pipe(Pipe_t *pipe)
 			if (t->pipe == pipe) {
 				print(" * remove");
 				remove_from_periodic_followup_list(t);
-
-				// Only free if not in QH list
-				Transfer_t *tr = (Transfer_t *)(pipe->qh.next);
-				while (((uint32_t)tr & 0xFFFFFFE0) && (tr != t)){
-					tr  = (Transfer_t *)(tr->qtd.next);
-				}
-				if (tr == t) {
-					println(" * defer free until QH");
-				} else {
-					println(" * free");
-					free_Transfer(t);  // The later code should actually free it...
-				}
+				free_Transfer(t);
 			} else {
 				println("");
 			}
 			t = next;
 		}
 	}
-	//
-	// TODO: do we need to look at pipe->qh.current ??
-	//
-	// free all the transfers still attached to the QH
-	println("  Free transfers attached to QH");
-	Transfer_t *tr = (Transfer_t *)(pipe->qh.next);
-	while ((uint32_t)tr & 0xFFFFFFE0) {
-		println("    * ", (uint32_t)tr);
-		Transfer_t *next = (Transfer_t *)(tr->qtd.next);
-		free_Transfer(tr);
-		tr = next;
-	}
+	Transfer_t *halt = pipe->halt_transfer;
+	pipe->halt_transfer = nullptr;
+	if (halt) free_Transfer(halt);
 	// hopefully we found everything...
 	free_Pipe(pipe);
 	println("* Delete Pipe completed");
