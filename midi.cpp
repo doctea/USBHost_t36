@@ -270,8 +270,10 @@ void MIDIDeviceBase::tx_data(const Transfer_t *transfer)
 {
 	if (transfer->qtd.token & 0x7F) {
 		if (tx_transfer_errors_ != UINT32_MAX) ++tx_transfer_errors_;
+	#if USBHOST_T36_ENABLE_DIAGNOSTICS
 	} else if (tx_transfers_completed_ != UINT32_MAX) {
 		++tx_transfers_completed_;
+	#endif
 	}
 	println("MIDIDevice transmit complete");
 	print("  MIDI Data: ");
@@ -406,8 +408,10 @@ bool MIDIDeviceBase::try_write_buffer(uint32_t data)
 				if (!accepted) {
 					*count = previous;
 					txtimer.start(tx_max >= 128 ? 200 : 1500);
+				#if USBHOST_T36_ENABLE_DIAGNOSTICS
 				} else if (tx_transfers_submitted_ != UINT32_MAX) {
 					++tx_transfers_submitted_;
+				#endif
 				}
 			} else {
 				txtimer.start(tx_max >= 128 ? 200 : 1500);
@@ -422,7 +426,9 @@ bool MIDIDeviceBase::try_write_buffer(uint32_t data)
 void MIDIDeviceBase::timer_event(USBDriverTimer *timer)
 {
 	if (!txpipe) return;
+	#if USBHOST_T36_ENABLE_DIAGNOSTICS
 	if (tx_timer_callbacks_ != UINT32_MAX) ++tx_timer_callbacks_;
+	#endif
 	drain_tx_queue();
 	flush_tx_buffers();
 }
@@ -443,8 +449,10 @@ void MIDIDeviceBase::flush_tx_buffers()
 		if (!queue_Data_Transfer(txpipe, tx_buffer1, tx1*4, this)) {
 			tx1_count = tx1;
 			retry = true;
+		#if USBHOST_T36_ENABLE_DIAGNOSTICS
 		} else if (tx_transfers_submitted_ != UINT32_MAX) {
 			++tx_transfers_submitted_;
+		#endif
 		}
 	}
 	uint32_t tx2 = tx2_count;
@@ -453,8 +461,10 @@ void MIDIDeviceBase::flush_tx_buffers()
 		if (!queue_Data_Transfer(txpipe, tx_buffer2, tx2*4, this)) {
 			tx2_count = tx2;
 			retry = true;
+		#if USBHOST_T36_ENABLE_DIAGNOSTICS
 		} else if (tx_transfers_submitted_ != UINT32_MAX) {
 			++tx_transfers_submitted_;
+		#endif
 		}
 	}
 	if (retry) txtimer.start(tx_max >= 128 ? 200 : 1500);

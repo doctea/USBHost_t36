@@ -106,7 +106,10 @@ static void remove_from_periodic_followup_list(Transfer_t *transfer);
 #define println USBHost::println_
 
 volatile bool USBHost::system_error = false;
+volatile USBHost::HostFault USBHost::host_fault = USBHost::HostFault::None;
+volatile bool USBHost::cleanup_stop_confirmed = false;
 
+#if USBHOST_T36_ENABLE_DIAGNOSTICS
 USBHost::ControllerDiagnosticInfo USBHost::getControllerDiagnosticInfo()
 {
 	const bool irq_enabled = __irq_enabled();
@@ -160,6 +163,7 @@ void USBHost::captureAsyncTransferDiagnostics(PipeDiagnosticInfo *info, uint32_t
 		for (uint32_t index = 0; index < count; ++index) info[index].followup_truncated = true;
 	}
 }
+#endif
 
 // Busy-waits use the cycle counter: micros() stops advancing while SysTick is blocked (eg in the USB ISR).
 static inline uint32_t us_to_cycles(uint32_t us)
@@ -177,29 +181,30 @@ static bool wait_usbsts(uint32_t mask, uint32_t want, uint32_t timeout_us)
 	const uint32_t start = ARM_DWT_CYCCNT;
 	const uint32_t limit = us_to_cycles(timeout_us);
 	while ((USBHS_USBSTS & mask) != want) {
-		if (USBHS_USBSTS & USBHS_USBSTS_HCH) return false;
+		if (!(mask & USBHS_USBSTS_HCH) && (USBHS_USBSTS & USBHS_USBSTS_HCH)) return false;
 		if (ARM_DWT_CYCCNT - start > limit) return false;
 	}
 	return true;
 }
 
 // Wait (bounded) until the periodic schedule has advanced past at least one full frame.
-static void wait_periodic_frame(void)
+static bool wait_periodic_frame(void)
 {
-	if (!(USBHS_USBSTS & USBHS_USBSTS_PS)) return;
+	if (!(USBHS_USBSTS & USBHS_USBSTS_PS)) return true;
 	const uint32_t start = ARM_DWT_CYCCNT;
 	const uint32_t limit = us_to_cycles(3000);
 	uint32_t last = USBHS_FRINDEX;
 	uint32_t changes = 0;
 	while (changes < 9) {
-		if (USBHS_USBSTS & USBHS_USBSTS_HCH) return;
-		if (ARM_DWT_CYCCNT - start > limit) return;
+		if (USBHS_USBSTS & USBHS_USBSTS_HCH) return true;
+		if (ARM_DWT_CYCCNT - start > limit) return false;
 		uint32_t now = USBHS_FRINDEX;
 		if (now != last) {
 			last = now;
 			changes++;
 		}
 	}
+	return true;
 }
 
 void USBHost::begin()
@@ -432,6 +437,8 @@ void USBHost::isr()
 	if (stat & USBHS_USBSTS_SEI) {
 		println("USB host system error, controller halted");
 		system_error = true;
+		host_fault = HostFault::SystemError;
+		cleanup_stop_confirmed = false;
 		recordDiagnosticError(DiagnosticError::SystemError, nullptr, stat);
 	}
 	// errors first, so halted qTDs aren't consumed by the normal followup before the pipe is unhalted
@@ -733,6 +740,7 @@ static uint32_t QH_capabilities2(uint32_t high_bw_mult, uint32_t hub_port_number
 Pipe_t * USBHost::new_Pipe(Device_t *dev, uint32_t type, uint32_t endpoint,
 	uint32_t direction, uint32_t maxlen, uint32_t interval)
 {
+	if (system_error) return NULL;
 	Pipe_t *pipe;
 	Transfer_t *halt;
 	uint32_t c=0, dtc=0;
@@ -849,6 +857,7 @@ static void init_qTD(volatile Transfer_t *t, void *buf, uint32_t len,
 //
 bool USBHost::queue_Control_Transfer(Device_t *dev, setup_t *setup, void *buf, USBDriver *driver)
 {
+	if (system_error) return false;
 	Transfer_t *transfer, *data, *status;
 	uint32_t status_direction;
 
@@ -917,6 +926,7 @@ bool USBHost::queue_Control_Transfer(Device_t *dev, setup_t *setup, void *buf, U
 //
 bool USBHost::queue_Data_Transfer(Pipe_t *pipe, void *buffer, uint32_t len, USBDriver *driver)
 {
+	if (system_error) return false;
 	Transfer_t *transfer, *data, *next;
 	uint8_t *p = (uint8_t *)buffer;
 	uint32_t count;
@@ -997,6 +1007,7 @@ bool USBHost::queue_Data_Transfer(Pipe_t *pipe, void *buffer, uint32_t len, USBD
 
 bool USBHost::queue_Transfer(Pipe_t *pipe, Transfer_t *transfer)
 {
+	if (system_error) return false;
 	bool irq_was_enabled = __irq_enabled();
 	__disable_irq();
 
@@ -1059,9 +1070,11 @@ bool USBHost::queue_Transfer(Pipe_t *pipe, Transfer_t *transfer)
 	pipe->halt_transfer = transfer;
 	// old halt becomes new transfer, this commits all new qTDs to QH
 	halt->qtd.token = token;
+	#if USBHOST_T36_ENABLE_DIAGNOSTICS
 	if (pipe->diagnostic_submissions != UINT32_MAX) {
 		++pipe->diagnostic_submissions;
 	}
+	#endif
 	if (irq_was_enabled) __enable_irq();
 	return true;
 }
@@ -1082,6 +1095,7 @@ bool USBHost::followup_Transfer(Transfer_t *transfer)
 		}
 		// TODO: check error status
 		if (transfer->qtd.token & 0x8000) {
+			#if USBHOST_T36_ENABLE_DIAGNOSTICS
 			if (transfer->qtd.token & 0x7F) {
 				if (transfer->pipe->diagnostic_errors != UINT32_MAX) {
 					++transfer->pipe->diagnostic_errors;
@@ -1089,6 +1103,7 @@ bool USBHost::followup_Transfer(Transfer_t *transfer)
 			} else if (transfer->pipe->diagnostic_completions != UINT32_MAX) {
 				++transfer->pipe->diagnostic_completions;
 			}
+			#endif
 			// this transfer caused an interrupt
 			if (transfer->pipe->callback_function) {
 				// do the callback
@@ -1115,6 +1130,7 @@ void USBHost::followup_Error_list(bool periodic)
 		remove_from_periodic_followup_list : remove_from_async_followup_list;
 	Transfer_t *p = periodic ? periodic_followup_first : async_followup_first;
 	while (p) {
+		#if USBHOST_T36_ENABLE_DIAGNOSTICS
 		if ((p->qtd.token & 0xC0) == 0x40) {
 			if (p->pipe->diagnostic_errors != UINT32_MAX) {
 				++p->pipe->diagnostic_errors;
@@ -1131,6 +1147,7 @@ void USBHost::followup_Error_list(bool periodic)
 				recordDiagnosticError(DiagnosticError::EndpointTransfer, p->pipe->device, p->qtd.token);
 			}
 		}
+		#endif
 		if ((p->qtd.token & 0xC0) == 0x40 || followup_Transfer(p)) {
 			// transfer completed
 			Transfer_t *next = p->next_followup;
@@ -1515,9 +1532,55 @@ void USBHost::add_qh_to_periodic_schedule(Pipe_t *pipe)
 }
 
 
+const char *USBHost::getHostFaultReason()
+{
+	switch (host_fault) {
+		case HostFault::None: return "none";
+		case HostFault::SystemError: return "hardware-system-error";
+		case HostFault::AsyncLink: return "async-invalid-link";
+		case HostFault::AsyncRing: return "async-pipe-not-in-ring";
+		case HostFault::AsyncDisableTimeout: return "async-disable-timeout";
+		case HostFault::AsyncAdvanceTimeout: return "async-doorbell-timeout";
+		case HostFault::PeriodicLink: return "periodic-invalid-link";
+		case HostFault::PeriodicCycle: return "periodic-walk-limit";
+		case HostFault::PeriodicStopTimeout: return "periodic-controller-stop-timeout";
+		case HostFault::PeriodicRestartTimeout: return "periodic-controller-restart-timeout";
+		case HostFault::PeriodicFrameTimeout: return "periodic-frame-timeout-after-restart";
+	}
+	return "unknown";
+}
+
+bool USBHost::wasCleanupStopConfirmed()
+{
+	return cleanup_stop_confirmed;
+}
+
+bool USBHost::stop_controller_for_cleanup(bool latch_error, HostFault fault)
+{
+	if (latch_error) {
+		USBHost::host_fault = fault;
+		USBHost::system_error = true;
+	}
+	cleanup_stop_confirmed = false;
+	USBHS_USBINTR = 0;
+	USBHS_USBCMD &= ~(USBHS_USBCMD_RS | USBHS_USBCMD_ASE | USBHS_USBCMD_PSE | USBHS_USBCMD_IAA);
+	if (!wait_usbsts(USBHS_USBSTS_HCH, USBHS_USBSTS_HCH, 5000)) {
+		USBHost::host_fault = fault;
+		USBHost::system_error = true;
+		println("  controller stop timeout; retaining DMA memory");
+		return false;
+	}
+	cleanup_stop_confirmed = true;
+	return true;
+}
+
 void USBHost::delete_Pipe(Pipe_t *pipe)
 {
+	if (!pipe || system_error) return;
 	println("delete_Pipe ", (uint32_t)pipe, HEX);
+	uint32_t restart_command = 0;
+	uint32_t restart_interrupts = 0;
+	bool restart_controller = false;
 
 	// halt pipe, find and free all Transfer_t
 
@@ -1538,11 +1601,18 @@ void USBHost::delete_Pipe(Pipe_t *pipe)
 	if (isasync) {
 		// find the next QH in the async schedule loop
 		Pipe_t *next = (Pipe_t *)(pipe->qh.horizontal_link & 0xFFFFFFE0);
+		if (!next || (pipe->qh.horizontal_link & 0x1F) != 2) {
+			stop_controller_for_cleanup(true, HostFault::AsyncLink);
+			return;
+		}
 		if (next == pipe) {
 			// removing the only QH, so just shut down the async schedule
 			println("  shut down async schedule");
 			USBHS_USBCMD &= ~USBHS_USBCMD_ASE; // disable async schedule
-			if (!wait_usbsts(USBHS_USBSTS_AS, 0, 5000)) println("  async disable timeout");
+			if (!wait_usbsts(USBHS_USBSTS_AS, 0, 5000)) {
+				stop_controller_for_cleanup(true, HostFault::AsyncDisableTimeout);
+				return;
+			}
 			USBHS_ASYNCLISTADDR = 0;
 			async_pipe_head = NULL;
 		} else {
@@ -1552,7 +1622,7 @@ void USBHost::delete_Pipe(Pipe_t *pipe)
 			for (uint32_t guard = 0; ; guard++) {
 				Pipe_t *n = (Pipe_t *)(prev->qh.horizontal_link & 0xFFFFFFE0);
 				if (n == pipe) break;
-				if (n == NULL || n == next || guard > 256) {
+				if (n == NULL || n == next || guard > 256 || (prev->qh.horizontal_link & 0x1F) != 2) {
 					// corrupt ring, or pipe not in it
 					prev = NULL;
 					break;
@@ -1561,6 +1631,8 @@ void USBHost::delete_Pipe(Pipe_t *pipe)
 			}
 			if (prev == NULL) {
 				println("  QH not found in async schedule");
+				stop_controller_for_cleanup(true, HostFault::AsyncRing);
+				return;
 			} else {
 				// if removing the one with H bit, set another
 				if (pipe->qh.capabilities[0] & 0x8000) {
@@ -1572,8 +1644,12 @@ void USBHost::delete_Pipe(Pipe_t *pipe)
 				// do the Async Advance Doorbell handshake to wait to be
 				// sure the EHCI no longer references the removed QH
 				if (USBHS_USBSTS & USBHS_USBSTS_AS) {
+					USBHS_USBSTS = USBHS_USBSTS_AAI;
 					USBHS_USBCMD |= USBHS_USBCMD_IAA;
-					if (!wait_usbsts(USBHS_USBSTS_AAI, USBHS_USBSTS_AAI, 5000)) println("  IAA timeout");
+					if (!wait_usbsts(USBHS_USBSTS_AAI, USBHS_USBSTS_AAI, 5000)) {
+						stop_controller_for_cleanup(true, HostFault::AsyncAdvanceTimeout);
+						return;
+					}
 					USBHS_USBSTS = USBHS_USBSTS_AAI;
 				}
 			}
@@ -1603,12 +1679,17 @@ void USBHost::delete_Pipe(Pipe_t *pipe)
 				periodictable[i] = 1;
 				continue;
 			}
+			if ((num & 0x1F) != 2) {
+				stop_controller_for_cleanup(true, HostFault::PeriodicLink);
+				return;
+			}
 			if (node == pipe) {
 				periodictable[i] = pipe->qh.horizontal_link ? pipe->qh.horizontal_link : 1;
 				continue;
 			}
 			Pipe_t *prev = node;
-			for (uint32_t guard = 0; guard < 256; guard++) {
+			uint32_t guard = 0;
+			for (; guard < 256; guard++) {
 				num = node->qh.horizontal_link;
 				if (num & 1) break;
 				node = (Pipe_t *)(num & 0xFFFFFFE0);
@@ -1616,15 +1697,28 @@ void USBHost::delete_Pipe(Pipe_t *pipe)
 					prev->qh.horizontal_link = 1;
 					break;
 				}
+				if ((num & 0x1F) != 2) {
+					stop_controller_for_cleanup(true, HostFault::PeriodicLink);
+					return;
+				}
 				if (node == pipe) {
 					prev->qh.horizontal_link = node->qh.horizontal_link ? node->qh.horizontal_link : 1;
 					break;
 				}
 				prev = node;
 			}
+			if (guard == 256) {
+				stop_controller_for_cleanup(true, HostFault::PeriodicCycle);
+				return;
+			}
 		}
 		// the controller may still be using the QH within the current frame
-		wait_periodic_frame();
+		if (!wait_periodic_frame()) {
+			restart_command = USBHS_USBCMD & ~USBHS_USBCMD_IAA;
+			restart_interrupts = USBHS_USBINTR;
+			if (!stop_controller_for_cleanup(false, HostFault::PeriodicStopTimeout)) return;
+			restart_controller = true;
+		}
 		// subtract bandwidth from uframe_bandwidth array
 		if (pipe->device->speed == 2) {
 			uint32_t interval = pipe->bandwidth_interval;
@@ -1667,6 +1761,16 @@ void USBHost::delete_Pipe(Pipe_t *pipe)
 	Transfer_t *halt = pipe->halt_transfer;
 	pipe->halt_transfer = nullptr;
 	if (halt) free_Transfer(halt);
+	if (restart_controller) {
+		USBHS_ASYNCLISTADDR = (uint32_t)async_pipe_head;
+		if (!async_pipe_head) restart_command &= ~USBHS_USBCMD_ASE;
+		USBHS_USBCMD = restart_command;
+		if (!wait_usbsts(USBHS_USBSTS_HCH, 0, 5000)) {
+			stop_controller_for_cleanup(true, HostFault::PeriodicRestartTimeout);
+			return;
+		}
+		USBHS_USBINTR = restart_interrupts;
+	}
 	// hopefully we found everything...
 	free_Pipe(pipe);
 	println("* Delete Pipe completed");

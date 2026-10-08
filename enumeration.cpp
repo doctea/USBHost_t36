@@ -73,6 +73,7 @@ void USBHost::Task()
 	}
 }
 
+#if USBHOST_T36_ENABLE_DIAGNOSTICS
 uint32_t USBHost::getAsyncPipeDiagnostics(PipeDiagnosticInfo *info, uint32_t capacity)
 {
 	if (!info || !capacity) return 0;
@@ -114,6 +115,7 @@ uint32_t USBHost::getAsyncPipeDiagnostics(PipeDiagnosticInfo *info, uint32_t cap
 	if (irq_enabled) __enable_irq();
 	return count;
 }
+#endif
 
 // Drivers call this after they've completed initialization, so get themselves
 // added to the list of inactive drivers available for new devices during
@@ -139,6 +141,7 @@ void USBHost::driver_ready_for_device(USBDriver *driver)
 //
 Device_t * USBHost::new_Device(uint32_t speed, uint32_t hub_addr, uint32_t hub_port)
 {
+	if (system_error) return NULL;
 	Device_t *dev;
 
 	print("new_Device: ");
@@ -528,7 +531,7 @@ static void pipe_set_addr(Pipe_t *pipe, uint32_t addr)
 
 void USBHost::disconnect_Device(Device_t *dev)
 {
-	if (!dev) return;
+	if (!dev || system_error) return;
 	println("disconnect_Device:");
 
 	// unplugged mid-enumeration, release the lock so other devices can enumerate
@@ -548,15 +551,20 @@ void USBHost::disconnect_Device(Device_t *dev)
 		available_drivers = p;
 		p = next;
 	}
+	dev->drivers = NULL;
 	print_driverlist("available_drivers", available_drivers);
 
 	// delete all the pipes
 	for (Pipe_t *p = dev->data_pipes; p; ) {
 		Pipe_t *next = p->next;
 		delete_Pipe(p);
+		if (system_error) return;
+		dev->data_pipes = next;
 		p = next;
 	}
 	delete_Pipe(dev->control_pipe);
+	if (system_error) return;
+	dev->control_pipe = NULL;
 
 	// remove device from devlist and free its Device_t
 	Device_t *prev_dev = NULL;

@@ -24,8 +24,10 @@ const source = `
 #include <cstring>
 #include <iostream>
 #define HEX 16
+#define ASSERT_DIAGNOSTIC(condition) do { if (USBHOST_T36_ENABLE_DIAGNOSTICS) assert(condition); } while (0)
 struct Transfer_t;
 struct Device_t;
+struct strbuf_t;
 struct setup_t {
     uint8_t bmRequestType = 0, bRequest = 0;
     uint16_t wValue = 0, wIndex = 0, wLength = 0;
@@ -52,6 +54,10 @@ struct Pipe_t {
 struct USBDriver {
     unsigned calls = 0;
     uint32_t last_token = 0;
+    USBDriver *next = nullptr;
+    Device_t *device = nullptr;
+    unsigned disconnects = 0;
+    void disconnect() { ++disconnects; }
     void control(const Transfer_t *);
 };
 struct Device_t {
@@ -60,7 +66,8 @@ struct Device_t {
     uint8_t enum_state, address, bDeviceClass, bDeviceSubClass, bDeviceProtocol;
     uint8_t bmAttributes, bMaxPower, speed, hub_address, hub_port;
     uint16_t idVendor, idProduct, LanguageID;
-    void *strbuf;
+    strbuf_t *strbuf;
+    USBDriver *drivers;
     Device_t *next;
 };
 struct Transfer_t {
@@ -88,9 +95,15 @@ struct strbuf_t {
 };
 struct USBHost {
 ${extractFunction('USBHost_t36.h', '    enum class DiagnosticError', '    static void begin();')}
+    #if USBHOST_T36_ENABLE_DIAGNOSTICS
     static void recordDiagnosticError(DiagnosticError, const Device_t * = nullptr, uint32_t = 0);
+    #else
+    static void recordDiagnosticError(DiagnosticError, const Device_t * = nullptr, uint32_t = 0) {}
+    #endif
     static bool enumeration_busy;
     static bool system_error;
+    static volatile HostFault host_fault;
+    static volatile bool cleanup_stop_confirmed;
     static Device_t *new_Device(uint32_t, uint32_t, uint32_t);
     static Device_t *allocate_Device();
     static Pipe_t *allocate_Pipe();
@@ -99,6 +112,8 @@ ${extractFunction('USBHost_t36.h', '    enum class DiagnosticError', '    static
     static void free_Pipe(Pipe_t *);
     static void free_Transfer(Transfer_t *);
     static void free_string_buffer(strbuf_t *);
+    static void disconnect_Device(Device_t *);
+    static void print_driverlist(const char *, USBDriver *) {}
     static void contribute_Pipes(Pipe_t *, uint32_t);
     static void contribute_Transfers(Transfer_t *, uint32_t);
     static void countFree(uint32_t &, uint32_t &, uint32_t &, uint32_t &);
@@ -111,6 +126,7 @@ ${extractFunction('USBHost_t36.h', '    enum class DiagnosticError', '    static
     static void followup_Error_list(bool);
     static void captureAsyncTransferDiagnostics(PipeDiagnosticInfo *, uint32_t);
     static void delete_Pipe(Pipe_t *);
+    static bool stop_controller_for_cleanup(bool = true, HostFault = HostFault::None);
     static bool queue_Control_Transfer(Device_t *, setup_t *, void *, USBDriver *);
     static void print_device_descriptor(const uint8_t *) {}
     static void print_config_descriptor(const uint8_t *, uint32_t);
@@ -122,6 +138,8 @@ ${extractFunction('USBHost_t36.h', '    enum class DiagnosticError', '    static
 };
 bool USBHost::enumeration_busy = true;
 bool USBHost::system_error = false;
+volatile USBHost::HostFault USBHost::host_fault = USBHost::HostFault::None;
+volatile bool USBHost::cleanup_stop_confirmed = false;
 static uint32_t irq_state = 0;
 static unsigned irq_disables = 0;
 static int __irq_enabled() { return irq_state == 0; }
@@ -136,13 +154,14 @@ static void arm_dcache_flush(void *address, uint32_t length) {
     assert(length > 0 && irq_state == 1);
     ++cache_flushes;
 }
-${extractFunction('memory.cpp', 'struct USBErrorRecord {', '// Memory allocation for Device_t, Pipe_t and Transfer_t structures.')}
+${extractFunction('diagnostics.cpp', '#if USBHOST_T36_ENABLE_DIAGNOSTICS')}
 #undef __IMXRT1062__
 static uint8_t enumbuf[2048];
 static setup_t enumsetup, last_request;
 static uint16_t enumlen;
 static Device_t device;
 static Device_t *devlist = nullptr;
+static USBDriver *available_drivers = nullptr;
 ${extractFunction('memory.cpp', '// Lists of "free" memory', '// A small amount of non-driver memory')}
 static Pipe_t pipe;
 static bool queue_ok = true;
@@ -207,7 +226,11 @@ struct HubControlProbe : USBHost {
     Device_t *devicelist[MAXPORTS] = {};
     uint8_t portstate[MAXPORTS] = {};
     uint32_t port_status[MAXPORTS] = {};
+    #if USBHOST_T36_ENABLE_DIAGNOSTICS
     HubDiagnosticInfo getPortDiagnostics() const;
+    #else
+    HubDiagnosticInfo getPortDiagnostics() const { return {}; }
+    #endif
     uint8_t send_pending_poweron = 0, send_pending_getstatus = 0;
     uint8_t send_pending_clearstatus_connect = 0, send_pending_clearstatus_enable = 0;
     uint8_t send_pending_clearstatus_suspend = 0, send_pending_clearstatus_overcurrent = 0;
@@ -228,7 +251,7 @@ struct HubControlProbe : USBHost {
     }
 };
 ${extractFunction('hub.cpp', 'bool USBHub::can_send_control_now()', '\nvoid USBHub::send_setinterface()').replace(/USBHub::/g, 'HubControlProbe::')}
-${extractFunction('hub.cpp', 'USBHub::HubDiagnosticInfo USBHub::getPortDiagnostics() const', '\nbool USBHub::claim(').replace(/USBHub::/g, 'HubControlProbe::')}
+${extractFunction('hub.cpp', '#if USBHOST_T36_ENABLE_DIAGNOSTICS\nUSBHub::HubDiagnosticInfo USBHub::getPortDiagnostics() const', '\nbool USBHub::claim(').replace(/USBHub::/g, 'HubControlProbe::')}
 ${extractFunction('hub.cpp', 'static uint32_t lowestbit(', '\nvoid USBHub::control(').replace(/USBHub::/g, 'HubControlProbe::')}
 static Transfer_t *async_followup_first = nullptr, *async_followup_last = nullptr;
 static Transfer_t *periodic_followup_first = nullptr, *periodic_followup_last = nullptr;
@@ -245,20 +268,38 @@ ${extractFunction('ehci.cpp', '#ifndef USBHOST_T36_QTD_CERR', '\n\n\n// Create a
 ${extractFunction('ehci.cpp', 'void USBHost::followup_Error(void)', '\nstatic void add_to_async_followup_list(Transfer_t *first, Transfer_t *last)\n{').replace(/\(uint32_t\)/g, '(uintptr_t)')}
 constexpr uint32_t USBHS_USBCMD_ASE = 1, USBHS_USBCMD_IAA = 2;
 constexpr uint32_t USBHS_USBSTS_AS = 4, USBHS_USBSTS_AAI = 8;
+constexpr uint32_t USBHS_USBCMD_RS = 16, USBHS_USBCMD_PSE = 32, USBHS_USBSTS_HCH = 64;
 static uint32_t USBHS_USBCMD = 0, USBHS_USBSTS = 0;
 static uintptr_t USBHS_ASYNCLISTADDR = 0;
 static uint32_t USBHS_USBINTR = 0, USBHS_FRINDEX = 0, USBHS_PORTSC1 = 0;
-${extractFunction('ehci.cpp', 'USBHost::ControllerDiagnosticInfo USBHost::getControllerDiagnosticInfo()', '// Busy-waits use the cycle counter:')}
-${extractFunction('enumeration.cpp', 'uint32_t USBHost::getAsyncPipeDiagnostics(', '\n// Drivers call this after')}
+${extractFunction('ehci.cpp', '#if USBHOST_T36_ENABLE_DIAGNOSTICS\nUSBHost::ControllerDiagnosticInfo', '// Busy-waits use the cycle counter:')}
+${extractFunction('enumeration.cpp', '#if USBHOST_T36_ENABLE_DIAGNOSTICS\nuint32_t USBHost::getAsyncPipeDiagnostics(', '\n// Drivers call this after')}
 static void insert_async_pipe_probe(Pipe_t *pipe) {
 ${extractFunction('ehci.cpp', '\t\t// control or bulk: add to async queue', '\t} else if (type == 3)').replace(/\(uint32_t\)/g, '(uintptr_t)')}
 }
 constexpr uint32_t PERIODIC_LIST_SIZE = 8;
 static uintptr_t periodictable[PERIODIC_LIST_SIZE];
 static uint8_t uframe_bandwidth[PERIODIC_LIST_SIZE * 8] = {};
-static bool wait_usbsts(uint32_t, uint32_t, uint32_t) { return true; }
-static void wait_periodic_frame() {}
+static bool schedule_wait_ok = true;
+static bool periodic_clock_running = true;
+static bool controller_stop_ok = true, controller_start_ok = true;
+static unsigned periodic_wait_calls = 0, periodic_wait_fail_on_call = 0;
+static Pipe_t *restart_cleanup_probe = nullptr;
+static bool wait_usbsts(uint32_t mask, uint32_t want, uint32_t) {
+    if (mask == USBHS_USBSTS_HCH && !want && restart_cleanup_probe) {
+        assert(restart_cleanup_probe->halt_transfer == nullptr);
+        assert(free_Transfer_list != nullptr && free_Pipe_list == nullptr);
+    }
+    if (mask == USBHS_USBSTS_HCH) return want ? controller_stop_ok : controller_start_ok;
+    return schedule_wait_ok;
+}
+static bool wait_periodic_frame() {
+    ++periodic_wait_calls;
+    return schedule_wait_ok && periodic_clock_running && periodic_wait_calls != periodic_wait_fail_on_call;
+}
+${extractFunction('ehci.cpp', 'const char *USBHost::getHostFaultReason()', '\nvoid USBHost::delete_Pipe(')}
 ${extractFunction('ehci.cpp', 'void USBHost::delete_Pipe(Pipe_t *pipe)').replace(/\(uint32_t\)/g, '(uintptr_t)').replace(/0xFFFFFFE0/g, '~uintptr_t(31)').replace('uint32_t num = periodictable[i];', 'uintptr_t num = periodictable[i];')}
+${extractFunction('enumeration.cpp', 'void USBHost::disconnect_Device(Device_t *dev)').replace(/\(uint32_t\)/g, '(uintptr_t)')}
 static Transfer_t *retry_transfer = nullptr;
 static unsigned retry_callbacks = 0;
 static void retry_halted_transfer(const Transfer_t *transfer) {
@@ -270,6 +311,9 @@ static void retry_halted_transfer(const Transfer_t *transfer) {
 }
 static void reset(uint8_t state) {
     USBHost::clearDiagnosticInfo();
+    USBHost::system_error = false;
+    USBHost::host_fault = USBHost::HostFault::None;
+    USBHost::cleanup_stop_confirmed = false;
     device = Device_t{}; pipe = Pipe_t{}; devlist = nullptr;
     device.control_pipe = &pipe; device.enum_state = state;
     pipe.device = &device; pipe.callback_function = &USBHost::enumeration;
@@ -287,7 +331,7 @@ static void respond(uint32_t received, uint32_t token = 0) {
 static void failed() {
     assert(device.enum_state == 15 && !USBHost::enumeration_busy);
     assert(config_prints == 0 && claims == 0);
-    assert(USBHost::getDiagnosticInfo().count > 0);
+    ASSERT_DIAGNOSTIC(USBHost::getDiagnosticInfo().count > 0);
 }
 static void config_response(uint32_t received) {
     Transfer_t status;
@@ -319,6 +363,7 @@ static void test_root_port_acknowledgement() {
     }
 }
 static void test_hub_port_diagnostic_snapshot() {
+    #if USBHOST_T36_ENABLE_DIAGNOSTICS
     HubControlProbe hub;
     Device_t child = {};
     child.idVendor = 0x2e8a; child.idProduct = 0x10c1;
@@ -338,8 +383,18 @@ static void test_hub_port_diagnostic_snapshot() {
     irq_state = 1;
     hub.getPortDiagnostics();
     assert(irq_state == 1); ++tests;
+    #else
+    HubControlProbe hub;
+    assert(hub.getPortDiagnostics().port_count == 0); ++tests;
+    #endif
 }
 int main() {
+    #if !USBHOST_T36_ENABLE_DIAGNOSTICS
+    (void)&millis;
+    (void)&arm_dcache_flush;
+    (void)USBHS_FRINDEX;
+    (void)USBHS_PORTSC1;
+    #endif
     test_hub_port_diagnostic_snapshot();
     alignas(4096) uint8_t token_buffer[64] = {};
     Transfer_t token_probe;
@@ -383,12 +438,13 @@ int main() {
             hub.Task();
             assert(hub.sending_control_transfer == 0 && pending() == 8 && irq_state == initial_irq);
             const auto rejected = USBHost::getDiagnosticInfo();
-            assert(rejected.count == 1 && rejected.error == USBHost::DiagnosticError::ControlQueue);
-            assert(rejected.detail == last_request.word1 && rejected.vid == 0x05e3 && rejected.pid == 0x0610);
-            assert(rejected.address == 2 && last_request.wIndex == 3);
+            ASSERT_DIAGNOSTIC(rejected.count == 1 && rejected.error == USBHost::DiagnosticError::ControlQueue);
+            ASSERT_DIAGNOSTIC(rejected.detail == last_request.word1 && rejected.vid == 0x05e3 && rejected.pid == 0x0610);
+            ASSERT_DIAGNOSTIC(rejected.address == 2);
+            assert(last_request.wIndex == 3);
             hub.Task();
             assert(hub.sending_control_transfer == 0 && pending() == 8 && irq_state == initial_irq);
-            assert(USBHost::getDiagnosticInfo().count == 2);
+            ASSERT_DIAGNOSTIC(USBHost::getDiagnosticInfo().count == 2);
             queue_ok = true;
             hub.Task();
             assert(hub.sending_control_transfer == 1 && pending() == 0 && irq_state == initial_irq);
@@ -421,7 +477,7 @@ int main() {
         assert(dummy.qtd.next == reinterpret_cast<uintptr_t>(&incoming));
         assert(incoming.qtd.token == 0x40 && incoming.qtd.next == 1);
         assert(halted_pipe.halt_transfer == &incoming);
-        assert(halted_pipe.diagnostic_submissions == 1);
+        assert(halted_pipe.diagnostic_submissions == USBHOST_T36_ENABLE_DIAGNOSTICS);
         assert((pipe_type == 3 ? periodic_followup_first : async_followup_first) == &dummy);
         assert(irq_state == 0); ++tests;
     }
@@ -482,10 +538,11 @@ int main() {
         assert((pipe_type == 3 ? periodic_followup_first : async_followup_first) == &dummy);
         assert(dummy.qtd.token == 0x8080 && dummy.next_followup == nullptr);
         auto halted_error = USBHost::getDiagnosticInfo();
-        assert(halted_error.count == 1 && halted_error.error == USBHost::DiagnosticError::EndpointTransfer);
-        assert(halted_pipe.diagnostic_errors == 1 && halted_pipe.diagnostic_submissions == 1);
-        assert(halted_error.detail == 0x8040 && halted_error.vid == 0x2e8a && halted_error.pid == 0x10c1);
-        assert(halted_error.address == 6 && halted_error.hub == 2 && halted_error.port == 3);
+         ASSERT_DIAGNOSTIC(halted_error.count == 1 && halted_error.error == USBHost::DiagnosticError::EndpointTransfer);
+         assert(halted_pipe.diagnostic_errors == USBHOST_T36_ENABLE_DIAGNOSTICS &&
+             halted_pipe.diagnostic_submissions == USBHOST_T36_ENABLE_DIAGNOSTICS);
+         ASSERT_DIAGNOSTIC(halted_error.detail == 0x8040 && halted_error.vid == 0x2e8a && halted_error.pid == 0x10c1);
+         ASSERT_DIAGNOSTIC(halted_error.address == 6 && halted_error.hub == 2 && halted_error.port == 3);
         assert(USBHost::allocate_Transfer() == &failed);
         assert(free_Transfer_list == nullptr); ++tests;
     }
@@ -514,9 +571,10 @@ int main() {
         USBHost::followup_Error_list(false);
         const auto result = USBHost::getDiagnosticInfo();
         if (driver_owned) {
-            assert(owner.calls == 1 && result.count == 1);
-            assert(result.error == USBHost::DiagnosticError::EndpointTransfer);
-            assert(result.detail == (tokens[failed_stage] | error_bits));
+            assert(owner.calls == 1);
+            ASSERT_DIAGNOSTIC(result.count == 1);
+            ASSERT_DIAGNOSTIC(result.error == USBHost::DiagnosticError::EndpointTransfer);
+            ASSERT_DIAGNOSTIC(result.detail == (tokens[failed_stage] | error_bits));
             assert(owner.last_token == (tokens[2] | error_bits));
         } else {
             assert(owner.calls == 0 && result.count == 0);
@@ -555,9 +613,9 @@ int main() {
         USBHost::followup_Error_list(false);
         failed();
         const auto result = USBHost::getDiagnosticInfo();
-        assert(result.count == 1 && result.error == USBHost::DiagnosticError::EnumerationTransfer);
-        assert(result.state == state && result.hub == device.hub_address && result.port == 2 && result.address == device.address);
-        assert(result.detail == (tokens[stages - 1] | 0x40));
+        ASSERT_DIAGNOSTIC(result.count == 1 && result.error == USBHost::DiagnosticError::EnumerationTransfer);
+        ASSERT_DIAGNOSTIC(result.state == state && result.hub == device.hub_address && result.port == 2 && result.address == device.address);
+        ASSERT_DIAGNOSTIC(result.detail == (tokens[stages - 1] | 0x40));
         assert(pipe.qh.next == reinterpret_cast<uintptr_t>(&dummy) && pipe.qh.token == 0);
         assert(async_followup_first == &survivor && async_followup_last == &survivor);
         assert(survivor.prev_followup == nullptr && survivor.next_followup == nullptr);
@@ -668,10 +726,218 @@ int main() {
         async_pipe_head = nullptr;
         ++tests;
     }
+    {
+        alignas(32) Pipe_t dying, live_async, obsolete_async;
+        alignas(32) Transfer_t halt;
+        Device_t owner = {}; owner.speed = 2;
+        dying.type = 3; dying.device = &owner; dying.halt_transfer = &halt;
+        dying.qh.horizontal_link = 1;
+        for (auto &entry : periodictable) entry = 1;
+        periodictable[0] = reinterpret_cast<uintptr_t>(&dying) | 2;
+        free_Pipe_list = nullptr; free_Transfer_list = nullptr;
+        contributed_pipes = contributed_transfers = 1;
+        USBHost::system_error = false;
+        USBHost::host_fault = USBHost::HostFault::None;
+        live_async.qh.horizontal_link = reinterpret_cast<uintptr_t>(&live_async) | 2;
+        async_pipe_head = &live_async;
+        USBHS_ASYNCLISTADDR = reinterpret_cast<uintptr_t>(&obsolete_async);
+        USBHS_USBCMD = USBHS_USBCMD_RS | USBHS_USBCMD_PSE | USBHS_USBCMD_ASE;
+        USBHS_USBINTR = 0x1234;
+        schedule_wait_ok = true; periodic_clock_running = false;
+        controller_stop_ok = controller_start_ok = true;
+        restart_cleanup_probe = &dying;
+        periodic_wait_calls = 0; periodic_wait_fail_on_call = 1;
+        USBHost::delete_Pipe(&dying);
+        assert(!USBHost::system_error && periodic_wait_calls == 1);
+        assert(std::strcmp(USBHost::getHostFaultReason(), "none") == 0);
+        assert(USBHS_USBCMD == (USBHS_USBCMD_RS | USBHS_USBCMD_PSE | USBHS_USBCMD_ASE));
+        assert(USBHS_ASYNCLISTADDR == reinterpret_cast<uintptr_t>(&live_async));
+        assert(USBHS_USBINTR == 0x1234 && periodictable[0] == 1);
+        assert(free_Pipe_list == &dying && free_Transfer_list == &halt); ++tests;
+
+        for (bool stop_ok : {false, true}) {
+            dying = Pipe_t{}; dying.type = 3; dying.device = &owner; dying.halt_transfer = &halt;
+            dying.qh.horizontal_link = 1;
+            for (auto &entry : periodictable) entry = 1;
+            periodictable[0] = reinterpret_cast<uintptr_t>(&dying) | 2;
+            free_Pipe_list = nullptr; free_Transfer_list = nullptr;
+            USBHost::system_error = false;
+            USBHS_USBCMD = USBHS_USBCMD_RS | USBHS_USBCMD_PSE;
+            USBHS_USBINTR = 0x1234;
+            controller_stop_ok = stop_ok; controller_start_ok = false;
+            periodic_wait_calls = 0; periodic_wait_fail_on_call = 1;
+            USBHost::delete_Pipe(&dying);
+            assert(USBHost::system_error && free_Pipe_list == nullptr);
+            assert(free_Transfer_list == (stop_ok ? &halt : nullptr));
+            assert(USBHost::host_fault == (stop_ok ? USBHost::HostFault::PeriodicRestartTimeout : USBHost::HostFault::PeriodicStopTimeout));
+            assert(USBHost::wasCleanupStopConfirmed() == stop_ok);
+            assert(dying.halt_transfer == (stop_ok ? nullptr : &halt));
+            assert(!USBHS_USBCMD && !USBHS_USBINTR); ++tests;
+        }
+        restart_cleanup_probe = nullptr;
+        async_pipe_head = nullptr;
+        schedule_wait_ok = true;
+        periodic_clock_running = true;
+        controller_stop_ok = controller_start_ok = true;
+        periodic_wait_fail_on_call = 0;
+    }
+    for (uint32_t initial_irq : {0u, 1u}) {
+        alignas(32) Pipe_t periodic, control;
+        alignas(32) Transfer_t periodic_halt, periodic_pending, control_halt;
+        Device_t owner = {};
+        strbuf_t strings;
+        USBDriver driver;
+        owner.speed = 2; owner.enum_state = 15;
+        owner.data_pipes = &periodic; owner.control_pipe = &control;
+        owner.strbuf = &strings; owner.drivers = &driver;
+        driver.device = &owner; devlist = &owner; available_drivers = nullptr;
+        periodic.type = 3; periodic.device = &owner; periodic.halt_transfer = &periodic_halt;
+        periodic.qh.horizontal_link = 1;
+        periodic_pending.pipe = &periodic; periodic_pending.qtd.token = 0x80;
+        periodic_followup_first = periodic_followup_last = &periodic_pending;
+        control.type = 0; control.device = &owner; control.halt_transfer = &control_halt;
+        control.qh.horizontal_link = reinterpret_cast<uintptr_t>(&control) | 2;
+        async_followup_first = async_followup_last = nullptr;
+        async_pipe_head = &control;
+        USBHS_ASYNCLISTADDR = reinterpret_cast<uintptr_t>(&control);
+        for (auto &entry : periodictable) entry = 1;
+        periodictable[0] = reinterpret_cast<uintptr_t>(&periodic) | 2;
+        free_Device_list = nullptr; free_Pipe_list = nullptr;
+        free_Transfer_list = nullptr; free_strbuf_list = nullptr;
+        contributed_devices = contributed_strings = 1;
+        contributed_pipes = 2; contributed_transfers = 3;
+        USBHost::system_error = false; USBHost::host_fault = USBHost::HostFault::None;
+        USBHost::enumeration_busy = false; irq_state = initial_irq;
+        USBHS_USBSTS = USBHS_USBSTS_AS;
+        USBHS_USBCMD = USBHS_USBCMD_RS | USBHS_USBCMD_PSE | USBHS_USBCMD_ASE;
+        USBHS_USBINTR = 0x1234;
+        schedule_wait_ok = true; periodic_clock_running = false;
+        controller_stop_ok = controller_start_ok = true;
+        periodic_wait_calls = 0;
+        restart_cleanup_probe = &periodic;
+        USBHost::disconnect_Device(&owner);
+        assert(!USBHost::system_error && devlist == nullptr && periodic_wait_calls == 1);
+        assert(driver.device == nullptr && driver.disconnects == 1 && available_drivers == &driver);
+        assert(periodic_followup_first == nullptr && periodic_followup_last == nullptr);
+        assert(async_pipe_head == nullptr && USBHS_ASYNCLISTADDR == 0);
+        assert(USBHS_USBCMD == (USBHS_USBCMD_RS | USBHS_USBCMD_PSE) && USBHS_USBINTR == 0x1234);
+        uint32_t devices, pipes, transfers, strings_count;
+        USBHost::countFree(devices, pipes, transfers, strings_count);
+        assert(devices == 1 && pipes == 2 && transfers == 3 && strings_count == 1);
+        queue_ok = true;
+        const unsigned before_queues = queues;
+        assert(USBHost::new_Device(2, 0, 0) == &owner);
+        assert(devlist == &owner && owner.enum_state == 0 && USBHost::enumeration_busy);
+        assert(queues == before_queues + 1 && last_request.bRequest == 6 && last_request.wLength == 8);
+        assert(irq_state == initial_irq); ++tests;
+        restart_cleanup_probe = nullptr; periodic_clock_running = true;
+        devlist = nullptr; available_drivers = nullptr;
+        free_Device_list = nullptr; free_Pipe_list = nullptr;
+        free_Transfer_list = nullptr; free_strbuf_list = nullptr;
+    }
+    for (uint8_t pipe_type : {uint8_t(0), uint8_t(2)}) for (uint32_t initial_irq : {0u, 1u}) {
+        alignas(32) Pipe_t sole;
+        alignas(32) Transfer_t dummy, pending;
+        sole.type = pipe_type;
+        sole.qh.horizontal_link = reinterpret_cast<uintptr_t>(&sole) | 2;
+        sole.halt_transfer = &dummy;
+        pending.pipe = &sole;
+        pending.qtd.token = 0x80;
+        async_followup_first = async_followup_last = &pending;
+        async_pipe_head = &sole;
+        USBHS_USBCMD = USBHS_USBCMD_ASE;
+        USBHS_USBSTS = USBHS_USBSTS_AS;
+        free_Pipe_list = nullptr; free_Transfer_list = nullptr;
+        contributed_pipes = 1; contributed_transfers = 2;
+        schedule_wait_ok = false; USBHost::system_error = false; irq_state = initial_irq;
+        USBHost::delete_Pipe(&sole);
+        assert(free_Pipe_list == nullptr && free_Transfer_list == nullptr);
+        assert(sole.halt_transfer == &dummy && async_followup_first == &pending);
+        assert(std::strcmp(USBHost::getHostFaultReason(), "async-disable-timeout") == 0);
+        assert(USBHost::system_error && irq_state == initial_irq); ++tests;
+        schedule_wait_ok = true; USBHost::system_error = false;
+        async_pipe_head = nullptr; async_followup_first = async_followup_last = nullptr;
+    }
+    for (uint8_t pipe_type : {uint8_t(0), uint8_t(2), uint8_t(3)}) for (uint32_t initial_irq : {0u, 1u}) {
+        alignas(32) Pipe_t dying, survivor;
+        alignas(32) Transfer_t dummy, pending;
+        Device_t owner = {}; owner.speed = 2;
+        dying.type = pipe_type; dying.device = &owner; dying.halt_transfer = &dummy;
+        pending.pipe = &dying; pending.qtd.token = 0x80;
+        dying.qh.horizontal_link = reinterpret_cast<uintptr_t>(&survivor) | 2;
+        survivor.qh.horizontal_link = reinterpret_cast<uintptr_t>(&dying) | 2;
+        async_followup_first = async_followup_last = nullptr;
+        periodic_followup_first = periodic_followup_last = nullptr;
+        if (pipe_type == 3) {
+            for (auto &entry : periodictable) entry = 1;
+            periodictable[0] = reinterpret_cast<uintptr_t>(&dying) | 2;
+            dying.qh.horizontal_link = 1;
+            periodic_followup_first = periodic_followup_last = &pending;
+        } else async_followup_first = async_followup_last = &pending;
+        USBHS_USBSTS = USBHS_USBSTS_AS; USBHS_USBCMD = USBHS_USBCMD_ASE | USBHS_USBCMD_PSE | USBHS_USBCMD_RS;
+        USBHS_USBINTR = 0xFFFFFFFF;
+        free_Pipe_list = nullptr; free_Transfer_list = nullptr;
+        schedule_wait_ok = false; USBHost::system_error = false; irq_state = initial_irq;
+        controller_stop_ok = pipe_type != 3;
+        USBHost::delete_Pipe(&dying);
+        assert(USBHost::system_error && !USBHS_USBINTR && !USBHS_USBCMD);
+        assert(USBHost::host_fault == (pipe_type == 3 ? USBHost::HostFault::PeriodicStopTimeout : USBHost::HostFault::AsyncAdvanceTimeout));
+        assert(USBHost::wasCleanupStopConfirmed() == (pipe_type != 3));
+        assert(free_Pipe_list == nullptr && free_Transfer_list == nullptr && dying.halt_transfer == &dummy);
+        assert((pipe_type == 3 ? periodic_followup_first : async_followup_first) == &pending);
+        assert(!USBHost::queue_Transfer(&dying, &pending) && irq_state == initial_irq); ++tests;
+        schedule_wait_ok = true; USBHost::system_error = false;
+        controller_stop_ok = true;
+    }
+    for (uint8_t pipe_type : {uint8_t(0), uint8_t(2), uint8_t(3)}) for (bool cyclic : {false, true}) {
+        alignas(32) Pipe_t dying, survivor;
+        alignas(32) Transfer_t dummy;
+        Device_t owner = {}; dying.device = &owner;
+        dying.type = pipe_type; dying.halt_transfer = &dummy;
+        dying.qh.horizontal_link = cyclic ? reinterpret_cast<uintptr_t>(&survivor) | 2 : 0;
+        survivor.qh.horizontal_link = reinterpret_cast<uintptr_t>(&survivor) | 2;
+        for (auto &entry : periodictable) entry = 1;
+        if (pipe_type == 3) periodictable[0] = reinterpret_cast<uintptr_t>(&survivor) | (cyclic ? 2 : 0);
+        free_Pipe_list = nullptr; free_Transfer_list = nullptr;
+        USBHost::system_error = false;
+        USBHost::delete_Pipe(&dying);
+        assert(USBHost::system_error && free_Pipe_list == nullptr && free_Transfer_list == nullptr); ++tests;
+        const auto expected = pipe_type == 3
+            ? (cyclic ? USBHost::HostFault::PeriodicCycle : USBHost::HostFault::PeriodicLink)
+            : (cyclic ? USBHost::HostFault::AsyncRing : USBHost::HostFault::AsyncLink);
+        assert(USBHost::host_fault == expected);
+        USBHost::system_error = false;
+    }
+    for (uint8_t pipe_type : {uint8_t(0), uint8_t(2)}) for (uint32_t initial_irq : {0u, 1u}) {
+        alignas(32) Pipe_t dying;
+        alignas(32) Transfer_t dummy;
+        Device_t owner = {}; strbuf_t strings;
+        USBDriver driver;
+        dying.type = pipe_type; dying.device = &owner; dying.halt_transfer = &dummy;
+        dying.qh.horizontal_link = reinterpret_cast<uintptr_t>(&dying) | 2;
+        owner.control_pipe = pipe_type == 0 ? &dying : nullptr;
+        owner.data_pipes = pipe_type == 2 ? &dying : nullptr;
+        owner.drivers = &driver; owner.strbuf = &strings; devlist = &owner;
+        driver.device = &owner; available_drivers = nullptr;
+        free_Device_list = nullptr; free_Pipe_list = nullptr; free_Transfer_list = nullptr; free_strbuf_list = nullptr;
+        USBHS_USBSTS = USBHS_USBSTS_AS; USBHS_USBCMD = USBHS_USBCMD_ASE;
+        schedule_wait_ok = false; USBHost::system_error = false; irq_state = initial_irq;
+        USBHost::disconnect_Device(&owner);
+        assert(USBHost::system_error && devlist == &owner && owner.strbuf == &strings);
+        assert(free_Device_list == nullptr && free_Pipe_list == nullptr && free_Transfer_list == nullptr && free_strbuf_list == nullptr);
+        assert(owner.drivers == nullptr && driver.disconnects == 1 && driver.device == nullptr);
+        USBHost::disconnect_Device(&owner);
+        assert(driver.disconnects == 1 && irq_state == initial_irq); ++tests;
+        schedule_wait_ok = true; USBHost::system_error = false; devlist = nullptr; available_drivers = nullptr;
+    }
+    async_followup_first = async_followup_last = nullptr;
+    periodic_followup_first = periodic_followup_last = nullptr;
+    async_pipe_head = nullptr;
     contributed_transfers = 0;
     irq_state = 0;
     async_followup_first = async_followup_last = nullptr;
     periodic_followup_first = periodic_followup_last = nullptr;
+    #if USBHOST_T36_ENABLE_DIAGNOSTICS
     USBHost::beginDiagnosticProgress();
     assert(USBHost::getPreviousDiagnosticProgress().phase == USBHost::DiagnosticPhase::None); ++tests;
     usb_progress_record.magic = 0x12345678;
@@ -732,6 +998,23 @@ int main() {
     USBHost::clearDiagnosticInfo();
     assert(cache_flushes == before_clear + 1);
     assert(irq_state == 1 && USBHost::getDiagnosticInfo().count == 0); ++tests;
+    #else
+    for (uint32_t initial_irq : {0u, 1u}) {
+        irq_state = initial_irq;
+        const unsigned before_stubs = irq_disables;
+        USBHost::PipeDiagnosticInfo sample = {};
+        sample.address = 123;
+        USBHost::beginDiagnosticProgress();
+        USBHost::setDiagnosticPhase(USBHost::DiagnosticPhase::USBTask);
+        USBHost::recordDiagnosticError(USBHost::DiagnosticError::SystemError);
+        USBHost::clearDiagnosticInfo();
+        assert(USBHost::getDiagnosticInfo().count == 0);
+        assert(USBHost::getPreviousDiagnosticProgress().phase == USBHost::DiagnosticPhase::None);
+        assert(USBHost::getControllerDiagnosticInfo().command == 0);
+        assert(USBHost::getAsyncPipeDiagnostics(&sample, 1) == 0 && sample.address == 123);
+        assert(irq_state == initial_irq && irq_disables == before_stubs && cache_flushes == 0); ++tests;
+    }
+    #endif
     irq_state = 0;
     for (uint32_t initial_irq : {0u, 1u}) {
         Device_t pool_device = {};
@@ -773,14 +1056,14 @@ int main() {
         irq_state = 1;
         USBHost::countFree(devices, pipes, transfers, strings);
         assert(pipes == UINT32_MAX && irq_state == 1);
-        assert(USBHost::getDiagnosticInfo().error == USBHost::DiagnosticError::PipePoolCorruption);
-        assert(USBHost::getDiagnosticInfo().detail == 1); ++tests;
+        ASSERT_DIAGNOSTIC(USBHost::getDiagnosticInfo().error == USBHost::DiagnosticError::PipePoolCorruption);
+        ASSERT_DIAGNOSTIC(USBHost::getDiagnosticInfo().detail == 1); ++tests;
         irq_state = 0;
         free_Pipe_list = &pool[0];
         pool[0].qh.next = reinterpret_cast<uintptr_t>(&pool[0]);
         USBHost::countFree(devices, pipes, transfers, strings);
         assert(pipes == UINT32_MAX && irq_state == 0);
-        assert(USBHost::getDiagnosticInfo().error == USBHost::DiagnosticError::PipePoolCorruption); ++tests;
+        ASSERT_DIAGNOSTIC(USBHost::getDiagnosticInfo().error == USBHost::DiagnosticError::PipePoolCorruption); ++tests;
         free_Pipe_list = nullptr;
     }
     for (uint32_t initial_irq : {0u, 1u}) {
@@ -794,12 +1077,13 @@ int main() {
         assert(USBHost::getDiagnosticInfo().count == 0 && irq_state == initial_irq); ++tests;
         USBHost::free_Transfer(&pool[1]);
         auto duplicate = USBHost::getDiagnosticInfo();
-        assert(duplicate.error == USBHost::DiagnosticError::TransferDoubleFree && duplicate.detail != 0);
-        assert(std::strcmp(USBHost::diagnosticErrorName(duplicate.error), "Transfer double free") == 0);
+        ASSERT_DIAGNOSTIC(duplicate.error == USBHost::DiagnosticError::TransferDoubleFree && duplicate.detail != 0);
+        ASSERT_DIAGNOSTIC(std::strcmp(USBHost::diagnosticErrorName(duplicate.error), "Transfer double free") == 0);
         assert(free_Transfer_list == &pool[2] && irq_state == initial_irq); ++tests;
         USBHost::free_Transfer(&pool[2]);
-        assert(USBHost::getDiagnosticInfo().error == USBHost::DiagnosticError::TransferDoubleFree);
-        assert(USBHost::getDiagnosticInfo().count == duplicate.count + 1 && irq_state == initial_irq); ++tests;
+        ASSERT_DIAGNOSTIC(USBHost::getDiagnosticInfo().error == USBHost::DiagnosticError::TransferDoubleFree);
+        ASSERT_DIAGNOSTIC(USBHost::getDiagnosticInfo().count == duplicate.count + 1);
+        assert(irq_state == initial_irq); ++tests;
         assert(USBHost::allocate_Transfer() == &pool[2]);
         assert(USBHost::allocate_Transfer() == &pool[1]);
         assert(USBHost::allocate_Transfer() == &pool[0]);
@@ -810,34 +1094,41 @@ int main() {
         assert(USBHost::allocate_Transfer() == &pool[1] && irq_state == initial_irq); ++tests;
         free_Transfer_list = reinterpret_cast<Transfer_t *>(uintptr_t(1));
         USBHost::free_Transfer(&pool[2]);
-        assert(USBHost::getDiagnosticInfo().error == USBHost::DiagnosticError::TransferPoolCorruption);
-        assert(USBHost::getDiagnosticInfo().detail == 1 && irq_state == initial_irq);
+        ASSERT_DIAGNOSTIC(USBHost::getDiagnosticInfo().error == USBHost::DiagnosticError::TransferPoolCorruption);
+        ASSERT_DIAGNOSTIC(USBHost::getDiagnosticInfo().detail == 1);
+        assert(irq_state == initial_irq);
         assert(free_Transfer_list == reinterpret_cast<Transfer_t *>(uintptr_t(1))); ++tests;
         free_Transfer_list = &pool[0];
         Transfer_t *cycle = &pool[0];
         std::memcpy(static_cast<void *>(&pool[0]), &cycle, sizeof(cycle));
         USBHost::free_Transfer(&pool[2]);
-        assert(USBHost::getDiagnosticInfo().error == USBHost::DiagnosticError::TransferPoolCorruption);
+        ASSERT_DIAGNOSTIC(USBHost::getDiagnosticInfo().error == USBHost::DiagnosticError::TransferPoolCorruption);
         assert(free_Transfer_list == &pool[0] && irq_state == initial_irq); ++tests;
         free_Transfer_list = nullptr;
     }
     irq_state = 0;
     assert(USBHost::allocate_Device() == nullptr);
-    assert(USBHost::getDiagnosticInfo().error == USBHost::DiagnosticError::DevicePool); ++tests;
+    ASSERT_DIAGNOSTIC(USBHost::getDiagnosticInfo().error == USBHost::DiagnosticError::DevicePool); ++tests;
     assert(USBHost::allocate_Pipe() == nullptr);
-    assert(USBHost::getDiagnosticInfo().error == USBHost::DiagnosticError::PipePool); ++tests;
+    ASSERT_DIAGNOSTIC(USBHost::getDiagnosticInfo().error == USBHost::DiagnosticError::PipePool); ++tests;
     assert(USBHost::allocate_Transfer() == nullptr);
-    assert(USBHost::getDiagnosticInfo().error == USBHost::DiagnosticError::TransferPool); ++tests;
+    ASSERT_DIAGNOSTIC(USBHost::getDiagnosticInfo().error == USBHost::DiagnosticError::TransferPool); ++tests;
     {
         constexpr uint32_t USBHS_USBSTS_SEI = 0x10;
         const uint32_t stat = USBHS_USBSTS_SEI;
         ${extractFunction('ehci.cpp', '\tif (stat & USBHS_USBSTS_SEI) {', '\t// errors first,')
             .replace('recordDiagnosticError(', 'USBHost::recordDiagnosticError(')
             .replace('DiagnosticError::', 'USBHost::DiagnosticError::')
+            .replace('HostFault::', 'USBHost::HostFault::')
+            .replace('host_fault =', 'USBHost::host_fault =')
+            .replace('cleanup_stop_confirmed =', 'USBHost::cleanup_stop_confirmed =')
             .replace('system_error =', 'USBHost::system_error =')}
         assert(USBHost::system_error);
-        assert(USBHost::getDiagnosticInfo().error == USBHost::DiagnosticError::SystemError);
-        assert(USBHost::getDiagnosticInfo().detail == stat); ++tests;
+        assert(std::strcmp(USBHost::getHostFaultReason(), "hardware-system-error") == 0);
+        assert(!USBHost::wasCleanupStopConfirmed());
+        ASSERT_DIAGNOSTIC(USBHost::getDiagnosticInfo().error == USBHost::DiagnosticError::SystemError);
+        ASSERT_DIAGNOSTIC(USBHost::getDiagnosticInfo().detail == stat); ++tests;
+        assert(USBHost::new_Device(1, 0, 0) == nullptr && USBHost::system_error); ++tests;
     }
     reset(0); queue_ok = false;
     device.control_pipe = nullptr; free_Device_list = &device;
@@ -895,8 +1186,8 @@ int main() {
         respond(received); assert(device.enum_state == 15 && !USBHost::enumeration_busy);
     }
     reset(13); respond(0, 0x40); failed();
-    assert(USBHost::getDiagnosticInfo().error == USBHost::DiagnosticError::EnumerationTransfer);
-    assert(USBHost::getDiagnosticInfo().state == 13 && USBHost::getDiagnosticInfo().detail == 0x40);
+    ASSERT_DIAGNOSTIC(USBHost::getDiagnosticInfo().error == USBHost::DiagnosticError::EnumerationTransfer);
+    ASSERT_DIAGNOSTIC(USBHost::getDiagnosticInfo().state == 13 && USBHost::getDiagnosticInfo().detail == 0x40);
     reset(6); respond(0, 0x40); assert(device.enum_state == 12 && USBHost::enumeration_busy);
     assert(USBHost::getDiagnosticInfo().count == 0);
     reset(14); respond(0, 0x40); failed();
@@ -927,10 +1218,11 @@ int main() {
     pipe.diagnostic_completions = pipe.diagnostic_errors = 0;
     Transfer_t lifecycle;
     lifecycle.pipe = &pipe; lifecycle.qtd.token = 0x8000;
-    assert(USBHost::followup_Transfer(&lifecycle) && pipe.diagnostic_completions == 1); ++tests;
+    assert(USBHost::followup_Transfer(&lifecycle) && pipe.diagnostic_completions == USBHOST_T36_ENABLE_DIAGNOSTICS); ++tests;
     lifecycle.qtd.token = 0x8008;
-    assert(USBHost::followup_Transfer(&lifecycle) && pipe.diagnostic_errors == 1); ++tests;
+    assert(USBHost::followup_Transfer(&lifecycle) && pipe.diagnostic_errors == USBHOST_T36_ENABLE_DIAGNOSTICS); ++tests;
 
+    #if USBHOST_T36_ENABLE_DIAGNOSTICS
     for (uint32_t initial_irq : {0u, 1u}) {
         irq_state = initial_irq;
         USBHS_USBCMD = 0x00080031;
@@ -1028,8 +1320,11 @@ int main() {
         async_followup_first = nullptr;
         devlist = nullptr;
     }
+    #endif
     test_root_port_acknowledgement();
-    std::cout << "PASS: " << tests << " enumeration/root-port regression cases (CERR=" << USBHOST_T36_QTD_CERR << ")\\n";
+    assert(USBHOST_T36_ENABLE_DIAGNOSTICS || cache_flushes == 0);
+    std::cout << "PASS: " << tests << " enumeration/root-port regression cases (CERR=" << USBHOST_T36_QTD_CERR
+              << ", diagnostics=" << USBHOST_T36_ENABLE_DIAGNOSTICS << ")\\n";
 }
 `;
 
@@ -1042,24 +1337,33 @@ typedef unsigned int uint32_t;
 typedef unsigned short uint16_t;
 typedef unsigned char uint8_t;
 struct Device_t;
-struct Transfer_t;
+struct USBDriver;
+struct setup_t { uint32_t word1, word2; };
+typedef struct Transfer_struct Transfer_t;
 typedef struct Pipe_struct Pipe_t;
 ${extractFunction('USBHost_t36.h', 'struct Pipe_struct {', '// Transfer_t represents')}
+${extractFunction('USBHost_t36.h', 'struct Transfer_struct {', '/************************************************/')}
 static_assert(sizeof(void *) == 4, "Layout check requires 32-bit pointers");
 static_assert(sizeof(Pipe_t) == 96, "Pipe telemetry must reuse existing padding");
 static_assert(__builtin_offsetof(Pipe_t, qh) == 0, "QH must start at the pipe address");
 static_assert(sizeof(((Pipe_t *)0)->qh) == 48, "EHCI QH layout must stay unchanged");
+static_assert(sizeof(Transfer_t) == 64, "Transfer pool stride must stay unchanged");
+static_assert(__builtin_offsetof(Transfer_t, qtd) == 0, "qTD must start at the transfer address");
+static_assert(sizeof(((Transfer_t *)0)->qtd) == 32, "EHCI qTD layout must stay unchanged");
 `;
-    const layoutBuild = spawnSync(compiler, [
-        '-m32', '-std=c++11', '-Wall', '-Wextra', '-Werror', '-fsyntax-only', '-x', 'c++', '-',
-    ], { input: layoutSource, encoding: 'utf8' });
-    if (layoutBuild.error) throw layoutBuild.error;
-    if (layoutBuild.status !== 0) throw new Error(layoutBuild.stderr || '32-bit pipe layout check failed');
-    process.stdout.write('PASS: production 32-bit pipe layout (96-byte, 32-byte-aligned pool stride)\n');
-    for (const retryLimit of [0, 3]) {
+    for (const diagnostics of [0, 1]) {
+        const layoutBuild = spawnSync(compiler, [
+            '-m32', `-DUSBHOST_T36_ENABLE_DIAGNOSTICS=${diagnostics}`, '-std=c++11', '-Wall', '-Wextra', '-Werror', '-fsyntax-only', '-x', 'c++', '-',
+        ], { input: layoutSource, encoding: 'utf8' });
+        if (layoutBuild.error) throw layoutBuild.error;
+        if (layoutBuild.status !== 0) throw new Error(layoutBuild.stderr || '32-bit pipe layout check failed');
+        process.stdout.write(`PASS: production 32-bit DMA layouts (pipe=96 bytes, transfer=64 bytes, diagnostics=${diagnostics})\n`);
+    }
+    for (const diagnostics of [0, 1]) for (const retryLimit of [0, 3]) {
         const retryFlags = retryLimit === 0 ? [] : [`-DUSBHOST_T36_QTD_CERR=${retryLimit}`];
         const build = spawnSync(compiler, [
             '-std=c++11', '-Wall', '-Wextra', '-Werror', '-fsanitize=undefined',
+            `-DUSBHOST_T36_ENABLE_DIAGNOSTICS=${diagnostics}`,
             ...retryFlags, '-x', 'c++', '-', '-o', executable,
         ], { input: source, encoding: 'utf8' });
         if (build.error) throw build.error;

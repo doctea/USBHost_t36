@@ -75,6 +75,11 @@ static inline int __irq_enabled()
 // Uncomment this line to see lots of debugging info!
 //#define USBHOST_PRINT_DEBUG
 
+#ifndef USBHOST_T36_ENABLE_DIAGNOSTICS
+#define USBHOST_T36_ENABLE_DIAGNOSTICS 0
+#endif
+static_assert(USBHOST_T36_ENABLE_DIAGNOSTICS == 0 || USBHOST_T36_ENABLE_DIAGNOSTICS == 1,
+    "USBHOST_T36_ENABLE_DIAGNOSTICS must be 0 or 1");
 
 // This can let you control where to send the debugging messages
 //#define USBHDBGSerial Serial1
@@ -243,9 +248,15 @@ struct Pipe_struct {
     uint8_t  bandwidth_stime;
     uint8_t  bandwidth_ctime;
     Transfer_t *halt_transfer;
+    #if USBHOST_T36_ENABLE_DIAGNOSTICS
     volatile uint32_t diagnostic_submissions;
     volatile uint32_t diagnostic_completions;
     volatile uint32_t diagnostic_errors;
+    #else
+    uint32_t unused2;
+    uint32_t unused3;
+    uint32_t unused4;
+    #endif
     uint32_t unused5;
 };
 
@@ -282,6 +293,8 @@ struct Transfer_struct {
     USBDriver  *driver;
 };
 
+static_assert(sizeof(void *) != 4 || sizeof(Transfer_t) % 32 == 0,
+    "USB transfer pool stride must preserve 32-byte qTD alignment");
 
 /************************************************/
 /*  Main USB EHCI Controller                    */
@@ -308,9 +321,15 @@ public:
         uint8_t port;
         bool previous_boot;
     };
+    #if USBHOST_T36_ENABLE_DIAGNOSTICS
     static DiagnosticInfo getDiagnosticInfo();
     static void clearDiagnosticInfo();
     static const char *diagnosticErrorName(DiagnosticError error);
+    #else
+    static DiagnosticInfo getDiagnosticInfo() { return {}; }
+    static void clearDiagnosticInfo() {}
+    static const char *diagnosticErrorName(DiagnosticError) { return "Disabled"; }
+    #endif
     enum class DiagnosticPhase : uint8_t {
         None, Loop, USBTask, PCUSBRead, BehaviourReads, BehaviourLoops,
         MIDIReconnect, SerialReconnect, MenuInputs, MenuDisplay, CVInputs,
@@ -322,10 +341,17 @@ public:
         uint32_t at_ms;
         DiagnosticPhase phase;
     };
+    #if USBHOST_T36_ENABLE_DIAGNOSTICS
     static void beginDiagnosticProgress();
     static void setDiagnosticPhase(DiagnosticPhase phase);
     static DiagnosticProgress getPreviousDiagnosticProgress();
     static const char *diagnosticPhaseName(DiagnosticPhase phase);
+    #else
+    static void beginDiagnosticProgress() {}
+    static void setDiagnosticPhase(DiagnosticPhase) {}
+    static DiagnosticProgress getPreviousDiagnosticProgress() { return {}; }
+    static const char *diagnosticPhaseName(DiagnosticPhase) { return "Disabled"; }
+    #endif
     struct ControllerDiagnosticInfo {
         uint32_t command;
         uint32_t status;
@@ -336,7 +362,11 @@ public:
         uint32_t port_status;
         bool enumerating;
     };
+    #if USBHOST_T36_ENABLE_DIAGNOSTICS
     static ControllerDiagnosticInfo getControllerDiagnosticInfo();
+    #else
+    static ControllerDiagnosticInfo getControllerDiagnosticInfo() { return {}; }
+    #endif
     struct PipeDiagnosticInfo {
         uintptr_t address;
         uintptr_t horizontal_link;
@@ -365,15 +395,30 @@ public:
         uint8_t type;
         uint8_t direction;
     };
+    #if USBHOST_T36_ENABLE_DIAGNOSTICS
     static uint32_t getAsyncPipeDiagnostics(PipeDiagnosticInfo *info, uint32_t capacity);
+    #else
+    static uint32_t getAsyncPipeDiagnostics(PipeDiagnosticInfo *, uint32_t) { return 0; }
+    #endif
+    enum class HostFault : uint8_t {
+        None, SystemError, AsyncLink, AsyncRing, AsyncDisableTimeout,
+        AsyncAdvanceTimeout, PeriodicLink, PeriodicCycle, PeriodicStopTimeout,
+        PeriodicRestartTimeout, PeriodicFrameTimeout
+    };
+    static const char *getHostFaultReason();
+    static bool wasCleanupStopConfirmed();
     static void begin();
     static void Task();
     static void countFree(uint32_t &devices, uint32_t &pipes, uint32_t &trans, uint32_t &strs);
     // true once the EHCI has reported a host system error (controller halts)
     static bool hadSystemError() { return system_error; }
 protected:
+    #if USBHOST_T36_ENABLE_DIAGNOSTICS
     static void recordDiagnosticError(DiagnosticError error, const Device_t *device = nullptr,
                                       uint32_t detail = 0);
+    #else
+    static void recordDiagnosticError(DiagnosticError, const Device_t * = nullptr, uint32_t = 0) {}
+    #endif
     static Pipe_t * new_Pipe(Device_t *dev, uint32_t type, uint32_t endpoint,
                              uint32_t direction, uint32_t maxlen, uint32_t interval = 0);
     static bool queue_Control_Transfer(Device_t *dev, setup_t *setup,
@@ -392,7 +437,9 @@ public: // Maybe others may want/need to contribute memory example HID devices m
     static void contribute_String_Buffers(strbuf_t *strbuf, uint32_t num);
 private:
     static void isr();
+    #if USBHOST_T36_ENABLE_DIAGNOSTICS
     static void captureAsyncTransferDiagnostics(PipeDiagnosticInfo *info, uint32_t count);
+    #endif
     static void convertStringDescriptorToASCIIString(uint8_t string_index, Device_t *dev, const Transfer_t *transfer);
     static void claim_drivers(Device_t *dev);
     static uint32_t assign_address(void);
@@ -413,7 +460,10 @@ private:
     static bool followup_Transfer(Transfer_t *transfer);
     static void followup_Error(void);
     static void followup_Error_list(bool periodic);
+    static bool stop_controller_for_cleanup(bool latch_error = true, HostFault fault = HostFault::None);
     static volatile bool system_error;
+    static volatile HostFault host_fault;
+    static volatile bool cleanup_stop_confirmed;
 public: // Maybe others may want/need to contribute memory example HID devices may want to add transfers.
 #ifdef USBHOST_PRINT_DEBUG
     static void print_(const Transfer_t *transfer);
@@ -727,7 +777,11 @@ public:
         bool change_pipe_present;
         PortDiagnosticInfo ports[MAXPORTS];
     };
+    #if USBHOST_T36_ENABLE_DIAGNOSTICS
     HubDiagnosticInfo getPortDiagnostics() const;
+    #else
+    HubDiagnosticInfo getPortDiagnostics() const { return {}; }
+    #endif
     virtual void Task();
     typedef uint8_t portbitmask_t;
     enum {
@@ -790,7 +844,9 @@ private:
     uint8_t  port_doing_reset;
     uint8_t  port_doing_reset_speed;
     uint8_t  portstate[MAXPORTS];
+    #if USBHOST_T36_ENABLE_DIAGNOSTICS
     uint32_t port_status[MAXPORTS];
+    #endif
     portbitmask_t send_pending_poweron;
     portbitmask_t send_pending_getstatus;
     portbitmask_t send_pending_clearstatus_connect;
@@ -1350,6 +1406,7 @@ public:
     }
     uint32_t getTransmitDropCount() const { return tx_dropped; }
     uint32_t getRealtimeTransmitDropCount() const { return tx_realtime_dropped; }
+    uint32_t getTransmitErrorCount() const { return tx_transfer_errors_; }
     uint16_t getTransmitPendingCount() const {
         bool irq_was_enabled = __irq_enabled();
         __disable_irq();
@@ -1359,6 +1416,11 @@ public:
     }
     uint8_t getRealtimeTransmitPendingCount() const { return tx_realtime_count; }
     TransmitDiagnosticInfo getTransmitDiagnosticInfo() const {
+        #if !USBHOST_T36_ENABLE_DIAGNOSTICS
+        TransmitDiagnosticInfo info = {};
+        info.errors = tx_transfer_errors_;
+        return info;
+        #else
         const bool irq_was_enabled = __irq_enabled();
         __disable_irq();
         TransmitDiagnosticInfo info = {
@@ -1368,6 +1430,7 @@ public:
         };
         if (irq_was_enabled) __enable_irq();
         return info;
+        #endif
     }
     void sendPolyPressure(uint8_t note, uint8_t pressure, uint8_t channel, uint8_t cable = 0) {
         send(0xA0, note, pressure, channel, cable);
@@ -1629,9 +1692,11 @@ private:
     uint16_t tx_queue_tail = 0;
     volatile uint16_t tx_queue_count = 0;
     volatile uint32_t tx_dropped = 0;
+    #if USBHOST_T36_ENABLE_DIAGNOSTICS
     volatile uint32_t tx_timer_callbacks_ = 0;
     volatile uint32_t tx_transfers_submitted_ = 0;
     volatile uint32_t tx_transfers_completed_ = 0;
+    #endif
     volatile uint32_t tx_transfer_errors_ = 0;
     static constexpr uint8_t TX_REALTIME_QUEUE_SIZE = 16;
     #ifdef USBHOST_MIDI_TX_QUEUE_ALLOCATOR

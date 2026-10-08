@@ -34,7 +34,9 @@ volatile bool USBHub::reset_busy = false;
 
 void USBHub::init()
 {
+	#if USBHOST_T36_ENABLE_DIAGNOSTICS
 	memset(port_status, 0, sizeof(port_status));
+	#endif
 	contribute_Devices(mydevices, sizeof(mydevices)/sizeof(Device_t));
 	contribute_Pipes(mypipes, sizeof(mypipes)/sizeof(Pipe_t));
 	contribute_Transfers(mytransfers, sizeof(mytransfers)/sizeof(Transfer_t));
@@ -42,6 +44,7 @@ void USBHub::init()
 	driver_ready_for_device(this);
 }
 
+#if USBHOST_T36_ENABLE_DIAGNOSTICS
 USBHub::HubDiagnosticInfo USBHub::getPortDiagnostics() const
 {
 	const bool irq_enabled = __irq_enabled();
@@ -67,6 +70,7 @@ USBHub::HubDiagnosticInfo USBHub::getPortDiagnostics() const
 	if (irq_enabled) __enable_irq();
 	return info;
 }
+#endif
 
 bool USBHub::claim(Device_t *dev, int type, const uint8_t *d, uint32_t len)
 {
@@ -127,7 +131,9 @@ bool USBHub::claim(Device_t *dev, int type, const uint8_t *d, uint32_t len)
 	sending_control_transfer = 0;
 	port_doing_reset = 0;
 	memset(portstate, 0, sizeof(portstate));
+	#if USBHOST_T36_ENABLE_DIAGNOSTICS
 	memset(port_status, 0, sizeof(port_status));
+	#endif
 	memset(devicelist, 0, sizeof(devicelist));
 
 	mk_setup(setup, 0xA0, 6, 0x2900, 0, sizeof(hub_desc));
@@ -363,7 +369,9 @@ void USBHub::status_change(const Transfer_t *transfer)
 void USBHub::new_port_status(uint32_t port, uint32_t status)
 {
 	if (port == 0 || port > numports) return;
+	#if USBHOST_T36_ENABLE_DIAGNOSTICS
 	port_status[port-1] = status;
+	#endif
 #if 1
 	print("  status=");
 	print(status, HEX);
@@ -567,7 +575,9 @@ void USBHub::disconnect()
 	sending_control_transfer = 0;
 	port_doing_reset = 0;
 	memset(portstate, 0, sizeof(portstate));
+	#if USBHOST_T36_ENABLE_DIAGNOSTICS
 	memset(port_status, 0, sizeof(port_status));
+	#endif
 	memset(devicelist, 0, sizeof(devicelist));
 	send_pending_poweron = 0;
 	send_pending_getstatus = 0;
